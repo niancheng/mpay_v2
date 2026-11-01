@@ -1,0 +1,27 @@
+name: Development PHP dependencies
+on:
+  push:
+    branches: [feat/alipay-store-bill]
+    paths: [.github/workflows/dev-dependencies.yml]
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, redis, gd, bcmath, sockets, pcntl
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist --no-scripts --no-progress
+      - run: tar -czf /tmp/php-dependencies.tar.gz vendor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php-dependencies
+          path: /tmp/php-dependencies.tar.gz
+          retention-days: 2
