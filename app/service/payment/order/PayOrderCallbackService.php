@@ -10,6 +10,7 @@ use app\common\interface\ChannelNotifyPayloadInterface;
 use app\exception\PaymentException;
 use app\exception\ResourceNotFoundException;
 use app\model\payment\PayOrder;
+use app\model\payment\PaymentChannel;
 use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\trade\PayOrderRepository;
 use app\service\payment\runtime\NotifyService;
@@ -160,6 +161,9 @@ class PayOrderCallbackService extends BaseService
             throw new ResourceNotFoundException('支付通道不存在', ['channel_id' => $channelId]);
         }
 
+        if ($channel->plugin_code === \app\service\payment\receipt\AlipayStoreReceiptRules::PLUGIN) {
+            return $this->handleStoreReceiptPayload($channel, $payload);
+        }
         $plugin = $this->paymentPluginManager->createByChannel($channel, (int) $channel->pay_type_id, true);
         if (!$plugin instanceof ChannelNotifyPayloadInterface) {
             throw new PaymentException('当前通道不支持数组载荷通知入口', 40200, [
@@ -409,5 +413,34 @@ class PayOrderCallbackService extends BaseService
             'process_status' => NotifyConstant::PROCESS_STATUS_FAILED,
             'process_result' => $exceptionResult,
         ]);
+    }
+
+    private function handleStoreReceiptPayload(PaymentChannel $channel, array $payload): array
+    {
+        $shouldNotify = false;
+        [$callback, $order] = \app\service\payment\receipt\AlipayReceiptGuard::atomic(function () use ($channel, $payload, &$shouldNotify) {
+            $plugin = $this->paymentPluginManager->createByChannel($channel, (int) $channel->pay_type_id, true);
+            if (!$plugin instanceof ChannelNotifyPayloadInterface) throw new PaymentException('门店监听插件不支持流水载荷', 40200);
+            $located = $plugin->channelNotifyPayload($payload);
+            $order = $this->payOrderRepository->findForUpdateByPayNo((string) $located['pay_no']);
+            if (!$order) throw new PaymentException('门店支付单不存在', 40200);
+            $this->assertChannelMatches($order, (int) $channel->id);
+            $result = PaymentPluginNotifyResultValidator::make($plugin->notifyPayload($payload))->withScene('notify_result')->withException(PaymentException::class)->validate();
+            $order = $this->freshPayOrder($order);
+            $this->assertNotifyPayNoMatches($order, $result);
+            $this->assertNotifyAmountMatches($order, $result);
+            $this->assertNotifyChannelReferencesMatch($order, $result);
+            $callback = $this->buildCallbackPayload($order, $payload, $result);
+            $order = $this->payOrderLifecycleService->markPaySuccessInCurrentTransaction((string) $order->pay_no, $callback, $shouldNotify);
+            $this->notifyService->recordPayCallback($callback);
+            return [$callback, $order];
+        });
+        // No merchant event/queue notification before the enclosing transaction commits.
+        if ($shouldNotify) {
+            \Webman\Event\Event::dispatch(\app\common\constant\EventConstant::PAYMENT_PAY_ORDER_SUCCEEDED, [
+                'pay_no' => (string) $order->pay_no, 'biz_no' => (string) $order->biz_no, 'pay_order' => $order,
+            ]);
+        }
+        return $callback;
     }
 }

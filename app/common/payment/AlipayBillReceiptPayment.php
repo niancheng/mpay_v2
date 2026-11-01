@@ -52,9 +52,9 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param PaymentTypeRepository $paymentTypeRepository 支付方式仓库
      */
     public function __construct(
-        private readonly PayOrderRepository $payOrderRepository,
-        private readonly PaymentChannelRepository $paymentChannelRepository,
-        private readonly PaymentTypeRepository $paymentTypeRepository
+        protected readonly PayOrderRepository $payOrderRepository,
+        protected readonly PaymentChannelRepository $paymentChannelRepository,
+        protected readonly PaymentTypeRepository $paymentTypeRepository
     ) {
     }
 
@@ -227,6 +227,14 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      */
     public function pay(array $order): array
     {
+        return \app\service\payment\receipt\AlipayReceiptGuard::atomic(function () use ($order) {
+            \app\service\payment\receipt\AlipayReceiptGuard::topology();
+            return $this->payLegacyReceipt($order);
+        });
+    }
+
+    private function payLegacyReceipt(array $order): array
+    {
         $payNo = (string) $order['pay_no'];
         $mode = $this->receiptMatchMode();
         $prepared = in_array($mode, ['remark', 'alipay_transfer'], true)
@@ -373,7 +381,14 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
         $tradeNo = $this->channelTradeNo($record);
         $notifiedAmount = isset($record['price']) ? $this->moneyToCents((string) $record['price']) : null;
 
-        $paidAmount = $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
+        $paidAmount = \app\service\payment\receipt\AlipayReceiptGuard::atomic(function () use ($payNo, $record, $tradeNo, $notifiedAmount) {
+            // The UID-wide ledger prevents replay into another plugin/configuration after a switch.
+            \app\service\payment\receipt\AlipayReceiptGuard::claim(
+                trim((string) $this->getConfig('bill_user_id')), $tradeNo, $payNo, '',
+                $notifiedAmount ?? 0, $this->paidAtTimestamp($record) ?? 0
+            );
+            return $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
+        });
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
@@ -414,14 +429,14 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param string $payType 支付方式
      * @return array<string, mixed>
      */
-    private function payResult(array $params, string $payNo, string $payType): array
+    protected function payResult(array $params, string $payNo, string $payType): array
     {
         $payType = trim($payType) !== '' ? trim($payType) : 'alipay';
 
         return [
             'pay_page' => 'page',
             'pay_type' => $payType,
-            'pay_product' => 'alipay_bill_receipt',
+            'pay_product' => $this->getCode(),
             'pay_action' => 'bill_watcher',
             'pay_params' => $params,
             'chan_order_no' => '',
@@ -560,7 +575,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      *
      * @return int 有效期秒数
      */
-    private function receiptValidSeconds(): int
+    protected function receiptValidSeconds(): int
     {
         return max(60, (int) $this->getConfig('receipt_valid_seconds', 300));
     }
@@ -572,7 +587,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      *
      * @return int 最大金额偏移，单位分
      */
-    private function amountOffsetMax(): int
+    protected function amountOffsetMax(): int
     {
         return min(99, max(0, (int) $this->getConfig('amount_offset_max', 99)));
     }
@@ -680,7 +695,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param string $payNo 支付单号
      * @return PayOrder
      */
-    private function lockedPayOrder(string $payNo): PayOrder
+    protected function lockedPayOrder(string $payNo): PayOrder
     {
         $payOrder = $this->payOrderRepository->findForUpdateByPayNo($payNo);
         if (!$payOrder) {
@@ -723,7 +738,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param PayOrder $payOrder 支付单
      * @return int 原始订单金额，单位分
      */
-    private function originalAmount(PayOrder $payOrder): int
+    protected function originalAmount(PayOrder $payOrder): int
     {
         $extJson = (array) ($payOrder->ext_json ?? []);
         $receiptMeta = (array) ($extJson['personal_receipt'] ?? []);
@@ -744,7 +759,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param int|null $notifiedAmount 实际付款金额
      * @return int 原始业务金额，单位分
      */
-    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): int
+    protected function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): int
     {
         return Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): int {
             $payOrder = $this->lockedPayOrder($payNo);
@@ -1012,7 +1027,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      *
      * @return array<int, int> 当前账号关联的通道ID
      */
-    private function receiptChannelIds(): array
+    protected function receiptChannelIds(): array
     {
         $ids = $this->paymentChannelRepository->idsByPluginConfig(
             (string) $this->getConfig('plugin_code', 'alipay_bill_receipt'),

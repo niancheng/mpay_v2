@@ -72,6 +72,24 @@ class PaymentPluginConfRepository extends BaseRepository
             ->whereIn('id', $ids)
             ->get($columns);
     }
+
+    public function updateById(int|string $id, array $data): bool
+    {
+        $row = $this->find($id);
+        if (!$row) return false;
+        $rules = \app\service\payment\receipt\AlipayStoreReceiptRules::class;
+        if (!$rules::supported((string) $row->plugin_code) && !$rules::supported((string) ($data['plugin_code'] ?? ''))) return parent::updateById($id, $data);
+        $row->fill($data);
+        return (bool) $row->save();
+    }
+
+    public function deleteById(int|string $id): bool
+    {
+        $row = $this->find($id);
+        if (!$row) return false;
+        if (!\app\service\payment\receipt\AlipayStoreReceiptRules::supported((string) $row->plugin_code)) return parent::deleteById($id);
+        return (bool) $row->delete();
+    }
 }
 
 

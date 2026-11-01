@@ -1,0 +1,21 @@
+# 复用现有 MySQL、Redis 和反向代理；不要创建第二套业务数据库。
+services:
+  mpay:
+    image: ghcr.io/niancheng/mpay_v2:store-bill-1.0.0
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${MPAY_PORT:-8787}:8787"
+    volumes:
+      # 先创建真实 .env 文件，避免被 Docker 当作目录；保留安装器所需写权限。
+      - ./.env:/app/.env
+      # 升级现有部署时必须改为原有目录，尤其保留 runtime/install.lock。
+      - ./runtime:/app/runtime
+      - ./storage:/app/public/storage
+    networks:
+      - mpay
+    stop_grace_period: 30s
+networks:
+  mpay:
+    external: true
+    name: ${MPAY_NETWORK:?请设置现有 MySQL 和 Redis 所在 Docker 网络}

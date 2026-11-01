@@ -200,6 +200,12 @@ class ReceiptWatcherService extends BaseService
                 continue;
             }
 
+            if ((string) $order->plugin_code === AlipayStoreReceiptRules::PLUGIN) {
+                $meta = (array) (((array) ($order->ext_json ?? []))['receipt_watcher'] ?? []);
+                // The dispatcher may have created the row but not yet reserved/presented the amount.
+                if (($meta['platform'] ?? '') !== AlipayStoreReceiptRules::PLUGIN || ($meta['mode'] ?? '') !== 'amount') continue;
+            }
+
             $ordersByAccount[$accountKey][] = [
                 'pay_no' => (string) $order->pay_no,
                 'channel_id' => (int) $order->channel_id,
@@ -530,8 +536,16 @@ class ReceiptWatcherService extends BaseService
      * @param string $payTypeCode 支付方式编码
      * @return PaymentChannel|null 支付通道
      */
-    public function resolveChannelForFlow(string $pluginCode, int $apiConfigId, string $payTypeCode): ?PaymentChannel
+    public function resolveChannelForFlow(string $pluginCode, int $apiConfigId, string $payTypeCode, array $record = []): ?PaymentChannel
     {
+        if ($pluginCode === AlipayStoreReceiptRules::PLUGIN) {
+            $id = $record['candidate_channel_id'] ?? 0;
+            if (!is_int($id) || $id <= 0 || $payTypeCode !== 'alipay') return null;
+            $channel = $this->paymentChannelRepository->find($id);
+            if (!$channel || $channel->plugin_code !== $pluginCode || (int) $channel->api_config_id !== $apiConfigId) return null;
+            $type = $this->paymentTypeRepository->find((int) $channel->pay_type_id);
+            return $type && $type->code === 'alipay' ? $channel : null;
+        }
         return $this->paymentChannelRepository->findReceiptFlowChannel($pluginCode, $apiConfigId, $payTypeCode);
     }
 

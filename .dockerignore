@@ -1,0 +1,13 @@
+.git
+.github
+.dev
+.env
+.env.*
+!.env.example
+vendor
+runtime
+public/storage
+tests
+*.log
+*.zip
+*.patch

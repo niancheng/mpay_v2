@@ -407,4 +407,17 @@ class PayOrderRepository extends BaseRepository
             ->where('expire_at', '>', $now)
             ->get($columns);
     }
+    /** Only committed store reservations occupy an amount; newly created/unprepared orders do not. */
+    public function listUsedStoreReceiptAmounts(array $channelIds, string $excludePayNo, string $now): array
+    {
+        return $this->query()->whereIn('channel_id', $channelIds)
+            ->where('pay_no', '<>', $excludePayNo)
+            ->whereIn('status', \app\common\constant\TradeConstant::orderMutableStatuses())
+            ->where('expire_at', '>', $now)
+            ->whereNotNull('ext_json->personal_receipt->receipt_amount')
+            ->lockForUpdate()->get(['ext_json'])
+            ->map(fn ($row) => (int) ($row->ext_json['personal_receipt']['receipt_amount'] ?? 0))
+            ->filter(fn ($amount) => $amount > 0)->values()->all();
+    }
+
 }

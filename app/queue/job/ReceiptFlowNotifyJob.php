@@ -70,7 +70,7 @@ class ReceiptFlowNotifyJob extends AbstractQueueJob
 
         try {
             $payType = trim((string) ($record['pay_type'] ?? ''));
-            $channel = $this->receiptWatcherService->resolveChannelForFlow($pluginCode, $apiConfigId, $payType);
+            $channel = $this->receiptWatcherService->resolveChannelForFlow($pluginCode, $apiConfigId, $payType, $record);
             if (!$channel) {
                 throw new PaymentException('流水未匹配到可用支付通道', 40200, [
                     'plugin_code' => $pluginCode,

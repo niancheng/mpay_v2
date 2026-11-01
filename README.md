@@ -792,3 +792,7 @@ MPAY V2 的开发离不开以下优秀开源项目。感谢这些项目的作者
 ## 📄 许可证
 
 仓库内包含 `LICENSE` 文件。使用、二次开发、商用发布和插件分发前，请确认当前仓库许可证、业务代码授权边界和第三方 SDK 的授权要求。
+
+## 此分支新增：支付宝门店账单收款
+
+新增 `alipay_store_bill_receipt`，仅金额匹配，使用 `alipay.data.bill.sell.query` 按完整门店编号隔离收款。需配套 receipt-watcher >=0.2.0，并在启动前执行新数据库迁移。配置、兼容边界、Docker镜像与升级/回滚步骤见 [支付宝门店账单收款说明](docs/ALIPAY_STORE_RECEIPT.md)。

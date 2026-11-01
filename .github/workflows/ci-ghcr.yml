@@ -1,0 +1,125 @@
+name: Test and publish MPAY GHCR image
+on:
+  push:
+    branches: [master, feat/alipay-store-bill]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: PHP ${{ matrix.php }} and MySQL receipt tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test-only
+          MYSQL_DATABASE: mpay_test_ci
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -ptest-only"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=15
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_DATABASE: mpay_test_ci
+      DB_USERNAME: root
+      DB_PASSWORD: test-only
+      MPAY_TEST_DATABASE: mpay_test_ci
+      CACHE_DRIVER: redis
+      REDIS_HOST: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, pdo_mysql, redis, gd, bcmath, sockets, pcntl
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist --no-scripts --no-progress
+      - name: PHP syntax checks
+        run: find app database/migrations tests -name '*.php' -print0 | xargs -0 -n1 php -l > /tmp/php-lint.log
+      - run: php tests/store_rules.php
+      - run: php tests/store_integration.php
+      - run: php tests/store_concurrency.php
+      - name: Build and smoke-test container
+        if: matrix.php == '8.3'
+        run: |
+          docker build --build-arg VCS_REF="$GITHUB_SHA" -t mpay:ci .
+          docker run --rm mpay:ci php -r 'require "vendor/autoload.php"; echo PHP_VERSION, "\n";'
+          docker run -d --name mpay-smoke -p 127.0.0.1:18787:8787 mpay:ci
+          trap 'docker logs mpay-smoke; docker rm -f mpay-smoke' EXIT
+          for i in $(seq 1 30); do
+            if curl --fail --silent -o /tmp/mpay-smoke.html http://127.0.0.1:18787/install; then break; fi
+            sleep 2
+          done
+          test -s /tmp/mpay-smoke.html
+          grep -qi '<html' /tmp/mpay-smoke.html
+      - name: Validate Compose
+        run: cp .env.example .env && MPAY_NETWORK=mpay-ci docker compose config --quiet
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          version="$(cat VERSION)"
+          [[ "$version" =~ ^[a-z0-9.-]+$ ]] || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: publish
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify published image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE@$DIGEST"
+          printf 'Image: %s:%s\nDigest: %s\n' "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
