@@ -410,14 +410,32 @@ class PayOrderRepository extends BaseRepository
     /** Only committed store reservations occupy an amount; newly created/unprepared orders do not. */
     public function listUsedStoreReceiptAmounts(array $channelIds, string $excludePayNo, string $now): array
     {
-        return $this->query()->whereIn('channel_id', $channelIds)
-            ->where('pay_no', '<>', $excludePayNo)
-            ->whereIn('status', \app\common\constant\TradeConstant::orderMutableStatuses())
-            ->where('expire_at', '>', $now)
-            ->whereNotNull('ext_json->personal_receipt->receipt_amount')
+        return $this->storeReceiptReservations($channelIds, $excludePayNo, $now)
             ->lockForUpdate()->get(['ext_json'])
             ->map(fn ($row) => (int) ($row->ext_json['personal_receipt']['receipt_amount'] ?? 0))
             ->filter(fn ($amount) => $amount > 0)->values()->all();
+    }
+
+    /** One non-locking query for all candidate scopes, including channels outside this route. */
+    public function listUsedStoreReceiptAmountsByChannel(array $channelIds, string $now): array
+    {
+        if ($channelIds === []) return [];
+        $amounts = [];
+        foreach ($this->storeReceiptReservations($channelIds, '', $now)->get(['channel_id', 'ext_json']) as $row) {
+            $amount = (int) ($row->ext_json['personal_receipt']['receipt_amount'] ?? 0);
+            if ($amount > 0) $amounts[(int) $row->channel_id][] = $amount;
+        }
+        return $amounts;
+    }
+
+    /** Shared occupancy predicate for preview and the locking allocation query. */
+    private function storeReceiptReservations(array $channelIds, string $excludePayNo, string $now): \Illuminate\Database\Eloquent\Builder
+    {
+        return $this->query()->whereIn('channel_id', array_values(array_unique(array_map('intval', $channelIds))))
+            ->where('pay_no', '<>', $excludePayNo)
+            ->whereIn('status', TradeConstant::orderMutableStatuses())
+            ->where('expire_at', '>', $now)
+            ->whereNotNull('ext_json->personal_receipt->receipt_amount');
     }
 
 }

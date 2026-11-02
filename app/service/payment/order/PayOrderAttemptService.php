@@ -11,6 +11,11 @@ use app\common\util\FormatHelper;
 use app\exception\BusinessStateException;
 use app\exception\ConflictException;
 use app\exception\PaymentProductUnavailableException;
+use app\exception\ReceiptAmountOccupiedException;
+use app\service\payment\receipt\AlipayReceiptGuard;
+use app\service\payment\receipt\AlipayStoreReceiptAllocationService;
+use app\service\payment\receipt\AlipayStoreReceiptRules;
+use support\Log;
 use app\exception\ValidationException;
 use app\model\merchant\Merchant;
 use app\model\payment\BizOrder;
@@ -60,7 +65,8 @@ class PayOrderAttemptService extends BaseService
         protected PayOrderRepository $payOrderRepository,
         protected PaymentTypeRepository $paymentTypeRepository,
         protected PaymentIdentityService $paymentIdentityService,
-        protected PayOrderChannelDispatchService $payOrderChannelDispatchService
+        protected PayOrderChannelDispatchService $payOrderChannelDispatchService,
+        protected AlipayStoreReceiptAllocationService $storeReceiptAllocationService
     ) {}
 
     /**
@@ -90,56 +96,88 @@ class PayOrderAttemptService extends BaseService
             }
         }
 
+        $phases = $route['receipt_attempt_phases'] ?? [['allow_offset' => true, 'candidates' => $candidates]];
         $productRejects = [];
+        $amountRejects = [];
         $lastPayNo = '';
-        foreach ($candidates as $candidate) {
-            /** @var PaymentChannel $channel */
-            $channel = $candidate['channel'];
-            $route['selected_channel'] = $candidate;
+        foreach ($route['receipt_deferred_candidates'] ?? [] as $candidate) {
+            $amountRejects[] = $this->receiptSkip($input, $candidate['channel'], false, $candidate['receipt_amount_message']);
+        }
+        foreach ($phases as $phase) {
+            $allowOffset = (bool) $phase['allow_offset'];
+            $checkedScopes = [];
+            foreach ($phase['candidates'] as $candidate) {
+                /** @var PaymentChannel $channel */
+                $channel = $candidate['channel'];
+                $isStore = $channel->plugin_code === AlipayStoreReceiptRules::PLUGIN;
+                $scopeId = (int) $channel->api_config_id;
+                if ($isStore && isset($checkedScopes[$scopeId])) continue;
+                $candidate['receipt_allow_offset'] = $allowOffset;
+                $route['selected_channel'] = $candidate;
 
-            try {
-                // 身份授权开始前只做插件本地产品判断；未开通当前产品时可换下一个候选通道。
-                $identityFlow = $this->paymentIdentityService->inspect($input, $merchant, $channel, $route);
-            } catch (PaymentProductUnavailableException $e) {
-                $productRejects[] = [
-                    'channel_id' => (int) $channel->id,
-                    'channel_name' => (string) $channel->name,
-                    'reason' => $e->getMessage(),
-                ];
-                continue;
-            }
+                try {
+                    // 身份授权前的本地产品判断保持原有语义，不把任意支付异常当成可换店。
+                    $identityFlow = $this->paymentIdentityService->inspect($input, $merchant, $channel, $route);
+                } catch (PaymentProductUnavailableException $e) {
+                    $productRejects[] = ['channel_id' => (int) $channel->id, 'channel_name' => (string) $channel->name, 'reason' => $e->getMessage()];
+                    continue;
+                }
+                if ($identityFlow !== null) return $identityFlow;
 
-            if ($identityFlow !== null) {
-                return $identityFlow;
-            }
+                if ($isStore) $checkedScopes[$scopeId] = true;
+                try {
+                    // This catch covers ONLY the database transaction, never dispatch/presentation.
+                    $prepared = $this->createPayAttempt($input, $merchant, $merchantGroupId, $channel,
+                        (int) ($route['poll_group']->id ?? 0), $route, $allowOffset);
+                } catch (ReceiptAmountOccupiedException $e) {
+                    // The business order, pay order, fee freeze and attempt count have all rolled back.
+                    $amountRejects[] = $this->receiptSkip($input, $channel, $allowOffset, $e->getMessage());
+                    continue;
+                }
 
-            try {
-                return $this->createAndDispatchPayAttempt(
-                    $input,
-                    $merchant,
-                    $merchantGroupId,
-                    $channel,
-                    (int) ($route['poll_group']->id ?? 0),
-                    $route
-                );
-            } catch (PaymentProductUnavailableException $e) {
-                // 只接收产品处理器执行前的本地不可用；已预写产品的拒绝不会以此类型越过派发层。
-                $lastPayNo = (string) $e->getData()['pay_no'];
-                $productRejects[] = [
-                    'channel_id' => (int) $channel->id,
-                    'channel_name' => (string) $channel->name,
-                    'reason' => $e->getMessage(),
-                ];
+                try {
+                    $result = $this->dispatchPayAttempt($prepared, $channel, $merchant);
+                    if ($isStore) {
+                        Log::info('支付宝门店金额分配成功', [
+                            'merchant_order_no' => (string) $input['merchant_order_no'],
+                            'pay_no' => (string) $result['pay_order']->pay_no,
+                            'channel_id' => (int) $channel->id,
+                            'original_amount' => $payAmount,
+                            'receipt_amount' => (int) $result['pay_order']->pay_amount,
+                            'phase' => $allowOffset ? 'offset_fallback' : 'original',
+                        ]);
+                    }
+                    return $result;
+                } catch (PaymentProductUnavailableException $e) {
+                    // Only the existing pre-handler product rejection may fall through after dispatch.
+                    $lastPayNo = (string) ($e->getData()['pay_no'] ?? '');
+                    $productRejects[] = ['channel_id' => (int) $channel->id, 'channel_name' => (string) $channel->name, 'reason' => $e->getMessage()];
+                }
             }
         }
 
-        throw new PaymentProductUnavailableException('未找到支持当前支付环境的已开通支付产品', 40200, [
-            // 所有候选拒绝时仍承接最后一笔真实支付单；未创建支付单时保持为空。
-            'pay_no' => $lastPayNo,
-            'pay_type_id' => $payTypeId,
-            'device' => (string) ($input['device'] ?? ''),
-            'channel_rejects' => $productRejects,
-        ]);
+        if ($amountRejects !== [] && $productRejects === []) {
+            throw new ReceiptAmountOccupiedException(data: ['pay_type_id' => $payTypeId,
+                'original_amount' => $payAmount, 'channel_rejects' => $amountRejects]);
+        }
+        throw new PaymentProductUnavailableException(
+            $amountRejects === [] ? '未找到支持当前支付环境的已开通支付产品' : '未找到可用支付通道：部分门店金额被占用，其余通道不支持当前支付环境',
+            40200, [
+                'pay_no' => $lastPayNo, 'pay_type_id' => $payTypeId,
+                'device' => (string) ($input['device'] ?? ''),
+                'channel_rejects' => $productRejects, 'receipt_rejects' => $amountRejects,
+            ]
+        );
+    }
+
+    private function receiptSkip(array $input, PaymentChannel $channel, bool $allowOffset, string $reason): array
+    {
+        $details = ['channel_id' => (int) $channel->id, 'channel_name' => (string) $channel->name,
+            'phase' => $allowOffset ? 'offset_fallback' : 'original', 'reason' => $reason];
+        Log::info('支付宝门店金额已占用，跳过候选通道', array_merge($details, [
+            'merchant_order_no' => (string) $input['merchant_order_no'], 'original_amount' => (int) $input['pay_amount'],
+        ]));
+        return $details;
     }
 
     /**
@@ -185,7 +223,9 @@ class PayOrderAttemptService extends BaseService
             return $identityFlow;
         }
 
-        return $this->createAndDispatchPayAttempt($input, $merchant, $merchantGroupId, $channel, 0, $route);
+        return $this->dispatchPayAttempt(
+            $this->createPayAttempt($input, $merchant, $merchantGroupId, $channel, 0, $route), $channel, $merchant
+        );
     }
 
     /**
@@ -222,7 +262,7 @@ class PayOrderAttemptService extends BaseService
     }
 
     /**
-     * 创建支付单并拉起支付插件。
+     * 事务内创建支付单；门店金额在同一事务中分配，插件派发必须在提交之后。
      *
      * @param array $input 支付预创建参数
      * @param Merchant $merchant 商户模型
@@ -232,13 +272,14 @@ class PayOrderAttemptService extends BaseService
      * @param array $route 路由上下文
      * @return array 发起结果
      */
-    private function createAndDispatchPayAttempt(
+    private function createPayAttempt(
         array $input,
         Merchant $merchant,
         int $merchantGroupId,
         PaymentChannel $channel,
         int $pollGroupId,
-        array $route
+        array $route,
+        bool $allowReceiptOffset = true
     ): array {
         $merchantId = (int) $input['merchant_id'];
         $merchantOrderNo = trim((string) $input['merchant_order_no']);
@@ -247,7 +288,7 @@ class PayOrderAttemptService extends BaseService
         $bizFields['ext_json'] = (array) ($bizFields['ext_json'] ?? []);
         unset($bizFields['ext_json']['payment'], $bizFields['ext_json']['presentation']);
 
-        $prepared = $this->transactionRetry(function () use (
+        $create = function () use (
             $input,
             $merchant,
             $merchantId,
@@ -257,7 +298,8 @@ class PayOrderAttemptService extends BaseService
             $channel,
             $pollGroupId,
             $route,
-            $bizFields
+            $bizFields,
+            $allowReceiptOffset
         ) {
             $expireAt = $this->resolvePayOrderExpireAt();
             $bizContext = $this->preparePayAttemptBizOrder(
@@ -283,6 +325,9 @@ class PayOrderAttemptService extends BaseService
                 $expireAt
             );
 
+            if ($channel->plugin_code === AlipayStoreReceiptRules::PLUGIN) {
+                $this->storeReceiptAllocationService->reserveNewOrder($payOrder, $channel, $allowReceiptOffset);
+            }
             $this->markBizOrderPaying($bizOrder, $payOrder, (int) $bizContext['attempt_no']);
 
             return [
@@ -291,8 +336,18 @@ class PayOrderAttemptService extends BaseService
                 'pay_order' => $payOrder,
                 'route' => $route,
             ];
-        });
+        };
 
+        // Acquire the durable guard BEFORE any business-order/account locks. Only local database
+        // work is retried for deadlocks; no identity authorization, plugin or network call is inside.
+        return $this->transactionRetry(fn () => $channel->plugin_code === AlipayStoreReceiptRules::PLUGIN
+            ? AlipayReceiptGuard::atomic($create)
+            : $create());
+    }
+
+    /** Outside the reservation transaction: unknown/late payment failures must never switch stores. */
+    private function dispatchPayAttempt(array $prepared, PaymentChannel $channel, Merchant $merchant): array
+    {
         /** @var PayOrder $payOrder */
         $payOrder = $prepared['pay_order'];
         /** @var BizOrder $bizOrder */
@@ -506,6 +561,10 @@ class PayOrderAttemptService extends BaseService
             (array) ($bizOrder->ext_json ?? []),
             (array) ($input['ext_json'] ?? [])
         );
+        if ($channel->plugin_code === AlipayStoreReceiptRules::PLUGIN) {
+            // These namespaces are server-owned. A new attempt cannot reuse caller-supplied metadata.
+            unset($payOrderExtJson['personal_receipt'], $payOrderExtJson['receipt_watcher']);
+        }
         $splitRateBp = (int) $channel->split_rate_bp;
         $merchantShareAmount = $this->calculateAmountByBp($payAmount, $splitRateBp);
         $serviceFeeAmount = max(0, $payAmount - $merchantShareAmount);

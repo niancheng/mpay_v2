@@ -7,6 +7,9 @@ use app\common\constant\CommonConstant;
 use app\common\constant\RouteConstant;
 use app\common\util\FormatHelper;
 use app\exception\BusinessStateException;
+use app\exception\ReceiptAmountOccupiedException;
+use app\service\payment\receipt\AlipayStoreReceiptAllocationService;
+use app\service\payment\receipt\AlipayStoreReceiptRules;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
 use Throwable;
@@ -59,7 +62,8 @@ class PaymentRouteResolverService extends BaseService
         protected ChannelDailyStatRepository $channelDailyStatRepository,
         protected PaymentPluginRepository $paymentPluginRepository,
         protected PaymentTypeRepository $paymentTypeRepository,
-        protected MerchantPolicyRepository $merchantPolicyRepository
+        protected MerchantPolicyRepository $merchantPolicyRepository,
+        protected AlipayStoreReceiptAllocationService $storeReceiptAllocationService
     ) {
     }
 
@@ -162,6 +166,7 @@ class PaymentRouteResolverService extends BaseService
             return [];
         }
 
+        $context['_preview'] = true;
         $available = [];
         foreach ($payTypeIds as $payTypeId) {
             try {
@@ -176,6 +181,7 @@ class PaymentRouteResolverService extends BaseService
                 continue;
             }
 
+            if (empty($route['available']) || empty($route['selected_channel'])) continue;
             $selected = $route['selected_channel'];
             /** @var PaymentChannel $channel */
             $channel = $selected['channel'];
@@ -343,16 +349,59 @@ class PaymentRouteResolverService extends BaseService
         $cursorKey = $this->routeCursorKey($merchantId, $payTypeId, $pollGroup ? (int) $pollGroup->id : 0);
         // 剩余候选再按轮询组策略排序，最终只从排序结果里挑一条。
         $ordered = $this->sortCandidates($eligible, $routeMode);
-        $selected = $this->selectChannel($ordered, $routeMode, $cursorKey);
+        $preview = !empty($context['_preview']);
+        $hasStoreReceipt = false;
+        foreach ($ordered as $candidate) {
+            if ($candidate['channel']->plugin_code === AlipayStoreReceiptRules::PLUGIN) $hasStoreReceipt = true;
+        }
+        if (!$hasStoreReceipt) {
+            // No store plugin in this route: preserve the existing selection/fallback contract.
+            return [
+                'available' => true,
+                'poll_group' => $pollGroup,
+                'route_preference' => $routePreference,
+                'candidates' => $ordered,
+                'rejected_candidates' => $rejected,
+                'selected_channel' => $this->selectChannel($ordered, $routeMode, $cursorKey, $preview),
+            ];
+        }
 
-        return [
-            'available' => true,
+        // Consume at most one cursor position, then keep that order through both phases.
+        $ordered = $this->orderReceiptAttempts($ordered, $routeMode, $cursorKey, $preview);
+        $plan = $this->storeReceiptAllocationService->preview($ordered, $payAmount);
+        $rejected = array_merge($rejected, $plan['rejected']);
+        $candidates = [];
+        foreach (array_merge($plan['original'], $plan['offset']) as $candidate) {
+            $candidates[(int) $candidate['channel_id']] ??= $candidate;
+        }
+        $selected = $plan['original'][0] ?? $plan['offset'][0] ?? null;
+        if ($selected !== null) $selected['receipt_allow_offset'] = $plan['original'] === [];
+        $result = [
+            'available' => $selected !== null,
             'poll_group' => $pollGroup,
             'route_preference' => $routePreference,
-            'candidates' => $ordered,
+            'candidates' => array_values($candidates),
             'rejected_candidates' => $rejected,
             'selected_channel' => $selected,
+            'receipt_deferred_candidates' => $plan['deferred'],
+            'receipt_attempt_phases' => [
+                ['allow_offset' => false, 'candidates' => $plan['original']],
+                ['allow_offset' => true, 'candidates' => $plan['offset']],
+            ],
         ];
+        if ($selected === null) {
+            $error = new ReceiptAmountOccupiedException(data: [
+                'poll_group_id' => $pollGroup ? (int) $pollGroup->id : 0,
+                'merchant_group_id' => $merchantGroupId,
+                'pay_type_id' => $payTypeId,
+                'original_amount' => $payAmount,
+                'reject_reasons' => $this->uniqueRejectedReasons($rejected),
+            ]);
+            if (!$preview) throw $error;
+            $result['reason'] = $error->getMessage();
+            $result['reason_code'] = 'receipt_amount_occupied';
+        }
+        return $result;
     }
 
     /**
@@ -675,6 +724,24 @@ class PaymentRouteResolverService extends BaseService
         return $candidates;
     }
 
+    /** Preserve circular order, or weighted sampling without replacement, across store skips. */
+    private function orderReceiptAttempts(array $candidates, int $routeMode, string $cursorKey, bool $preview): array
+    {
+        if ($routeMode === RouteConstant::ROUTE_MODE_WEIGHTED) {
+            $ordered = [];
+            while ($candidates !== []) {
+                $selected = $this->selectWeightedChannel($candidates);
+                $ordered[] = $selected;
+                $candidates = array_values(array_filter($candidates, static fn ($candidate) =>
+                    (int) $candidate['channel_id'] !== (int) $selected['channel_id']));
+            }
+            return $ordered;
+        }
+        $selected = $this->selectChannel($candidates, $routeMode, $cursorKey, $preview);
+        $index = (int) array_search((int) $selected['channel_id'], array_column($candidates, 'channel_id'), true);
+        return array_merge(array_slice($candidates, $index), array_slice($candidates, 0, $index));
+    }
+
     /**
      * 根据路由模式选择最终通道。
      *
@@ -683,7 +750,7 @@ class PaymentRouteResolverService extends BaseService
      * @param int $pollGroupId 轮询分组ID
      * @return array 选中的通道候选
      */
-    private function selectChannel(array $candidates, int $routeMode, string $cursorKey): array
+    private function selectChannel(array $candidates, int $routeMode, string $cursorKey, bool $preview = false): array
     {
         if (count($candidates) === 1) {
             return $candidates[0];
@@ -691,7 +758,7 @@ class PaymentRouteResolverService extends BaseService
 
         return match ($routeMode) {
             RouteConstant::ROUTE_MODE_WEIGHTED => $this->selectWeightedChannel($candidates),
-            RouteConstant::ROUTE_MODE_ORDER => $this->selectSequentialChannel($candidates, $cursorKey),
+            RouteConstant::ROUTE_MODE_ORDER => $this->selectSequentialChannel($candidates, $cursorKey, $preview),
             RouteConstant::ROUTE_MODE_FIRST_AVAILABLE => $this->selectDefaultChannel($candidates),
             default => $candidates[0],
         };
@@ -725,7 +792,7 @@ class PaymentRouteResolverService extends BaseService
      * @param string $cursorKey 轮询游标键
      * @return array 选中的通道候选
      */
-    private function selectSequentialChannel(array $candidates, string $cursorKey): array
+    private function selectSequentialChannel(array $candidates, string $cursorKey, bool $preview = false): array
     {
         if ($cursorKey === '') {
             return $candidates[0];
@@ -734,9 +801,9 @@ class PaymentRouteResolverService extends BaseService
         try {
             // 用 Redis 维护跨进程共享的轮询游标，避免每个 PHP 进程各选各的。
             $redisKey = sprintf('payment:route:round_robin:%s', $cursorKey);
-            $cursor = (int) Redis::incr($redisKey);
-            // 游标保留一个较长的生命周期，避免 Redis 清理后轮询顺序完全丢失。
-            Redis::expire($redisKey, 30 * 86400);
+            $cursor = $preview ? (int) Redis::get($redisKey) + 1 : (int) Redis::incr($redisKey);
+            // 预览只读，不推进游标，也不延长 TTL。
+            if (!$preview) Redis::expire($redisKey, 30 * 86400);
             // Redis 自增从 1 开始，这里转成 0 基索引后再对候选集取模。
             $index = max(0, ($cursor - 1) % count($candidates));
 
