@@ -9,6 +9,7 @@ use app\model\merchant\MerchantGroup;
 use app\model\merchant\MerchantAccount;
 use app\model\payment\PaymentChannel;
 use app\model\payment\PaymentPluginConf;
+use app\model\payment\PaymentPlugin;
 use app\model\payment\PaymentPollGroup;
 use app\model\payment\PaymentPollGroupBind;
 use app\model\payment\PaymentPollGroupChannel;
@@ -30,6 +31,13 @@ function routingFixture(int $stores = 2, int $offset = 0, int $mode = RouteConst
     $uid = '2088' . str_pad((string) random_int(100000, 999999999999), 12, '0', STR_PAD_LEFT);
     $typeId = (int) PaymentType::where('code', 'alipay')->value('id');
     if (!$typeId) throw new RuntimeException('Run store_integration.php before the routing tests');
+    // Migrations register only the new store plugin; the empty test database has no legacy seed data.
+    // Use the original plugin's own metadata so non-store route regression tests exercise a valid route.
+    $legacy = Container::get(\app\common\payment\AlipayBillReceiptPayment::class);
+    PaymentPlugin::firstOrCreate(['code' => $legacy->getCode()], [
+        'name' => $legacy->getName(), 'class_name' => 'AlipayBillReceiptPayment',
+        'plugin_type' => $legacy->getPluginType(), 'pay_types' => $legacy->getEnabledPayTypes(), 'status' => 1,
+    ]);
     $group = MerchantGroup::create(['group_name' => 'route-' . $seed, 'status' => 1]);
     $merchant = Merchant::create(['merchant_no' => 'RT-' . $seed, 'merchant_name' => '路由测试', 'group_id' => $group->id, 'status' => 1, 'pay_status' => 1]);
     MerchantAccount::create(['merchant_id' => $merchant->id, 'available_balance' => 1000000, 'frozen_balance' => 0]);
