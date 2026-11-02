@@ -58,6 +58,8 @@ jobs:
       - run: php tests/store_rules.php
       - run: php tests/store_integration.php
       - run: php tests/store_concurrency.php
+      - run: php tests/store_routing.php
+      - run: php tests/store_routing_concurrency.php
       - name: Build and smoke-test container
         if: matrix.php == '8.3'
         run: |
