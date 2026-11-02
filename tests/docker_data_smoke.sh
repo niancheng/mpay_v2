@@ -14,7 +14,8 @@ cleanup() {
 trap 'status=$?; cleanup; exit "$status"' EXIT
 fixture="$root/original"
 mkdir -p "$fixture/config" "$fixture/runtime/storage/private" "$fixture/public-storage/uploads" "$fixture/public/admin"
-printf 'AUTH_ADMIN_JWT_SECRET=%s\nAUTH_MERCHANT_JWT_SECRET=%s\n' "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$fixture/config/.env"
+# The original installer writes all three secrets; nested env() fallbacks are evaluated eagerly.
+printf 'AUTH_JWT_SECRET=%s\nAUTH_ADMIN_JWT_SECRET=%s\nAUTH_MERCHANT_JWT_SECRET=%s\n' "$(printf 'c%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$fixture/config/.env"
 printf "UNTRUSTED_VALUE='\$(touch /data/should-not-exist)'\n" >> "$fixture/config/.env"
 printf original-private-key > "$fixture/config/epay-platform-private.pem"
 printf original-install-lock > "$fixture/runtime/install.lock"
@@ -73,5 +74,10 @@ docker run --rm --platform "${MPAY_TEST_PLATFORM:-linux/amd64}" --mount "type=bi
     if (is_file("/data/config/epay-platform-private.pem")) exit(2);
     file_put_contents("/app/.env", "installer-writes-persist\n");
 '
-test "$(cat "$root/fresh/config/.env")" = installer-writes-persist
+# Keep the fresh secret file at 0600; verify through the image rather than weakening
+# permissions so an unprivileged host runner can read a root-owned config.
+docker run --rm --platform "${MPAY_TEST_PLATFORM:-linux/amd64}" --mount "type=bind,src=$root/fresh,dst=/data" "$image" php -r '
+    if (file_get_contents("/app/.env") !== "installer-writes-persist\n") exit(1);
+    if ((fileperms("/data/config/.env") & 0777) !== 0600) exit(2);
+'
 echo 'PASS: real Docker /data upgrade, recreation, readonly explicit mounts, failure guards and fresh install layout'
