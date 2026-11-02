@@ -52,7 +52,9 @@ jobs:
           coverage: none
       - run: composer install --no-interaction --prefer-dist --no-scripts --no-progress
       - name: PHP syntax checks
-        run: find app database/migrations tests -name '*.php' -print0 | xargs -0 -n1 php -l > /tmp/php-lint.log
+        run: find app database/migrations docker tests -name '*.php' -print0 | xargs -0 -n1 php -l > /tmp/php-lint.log
+      - name: Persistent data layout regression
+        run: php tests/docker_data_layout.php
       - run: php tests/store_rules.php
       - run: php tests/store_integration.php
       - run: php tests/store_concurrency.php
@@ -69,6 +71,9 @@ jobs:
           done
           test -s /tmp/mpay-smoke.html
           grep -qi '<html' /tmp/mpay-smoke.html
+      - name: Original v2.1.2 data volume and JWT upgrade smoke test
+        if: matrix.php == '8.3'
+        run: bash tests/docker_data_smoke.sh mpay:ci
       - name: Validate Compose
         run: cp .env.example .env && MPAY_NETWORK=mpay-ci docker compose config --quiet
   publish:
@@ -119,11 +124,13 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Verify published image
+      - name: Verify published image and both architecture data layouts
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           DIGEST: ${{ steps.publish.outputs.digest }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           docker buildx imagetools inspect "$IMAGE@$DIGEST"
-          printf 'Image: %s:%s\nDigest: %s\n' "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          MPAY_TEST_PLATFORM=linux/amd64 bash tests/docker_data_smoke.sh "$IMAGE@$DIGEST"
+          MPAY_TEST_PLATFORM=linux/arm64 bash tests/docker_data_smoke.sh "$IMAGE@$DIGEST"
+          printf 'Image: %s:%s\nDigest: %s\nBoth architecture data/JWT upgrade checks: passed\n' "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
