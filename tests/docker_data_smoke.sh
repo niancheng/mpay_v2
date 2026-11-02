@@ -3,7 +3,15 @@ set -euo pipefail
 image=${1:-mpay:ci}
 tests=$(cd "$(dirname "$0")" && pwd)
 root=$(mktemp -d)
-trap 'rm -rf "$root"' EXIT
+# Fresh /data files are created by container root; remove them through an isolated
+# cleanup mount instead of assuming the host runner can unlink root-owned files.
+cleanup() {
+    docker run --rm --platform "${MPAY_TEST_PLATFORM:-linux/amd64}" \
+        --mount "type=bind,src=$root,dst=/test-cleanup" --entrypoint sh "$image" \
+        -c 'find /test-cleanup -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +' >/dev/null 2>&1 || true
+    rmdir "$root" 2>/dev/null || true
+}
+trap 'status=$?; cleanup; exit "$status"' EXIT
 fixture="$root/original"
 mkdir -p "$fixture/config" "$fixture/runtime/storage/private" "$fixture/public-storage/uploads" "$fixture/public/admin"
 printf 'AUTH_ADMIN_JWT_SECRET=%s\nAUTH_MERCHANT_JWT_SECRET=%s\n' "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$fixture/config/.env"
