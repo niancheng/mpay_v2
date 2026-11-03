@@ -25,7 +25,7 @@ use support\Db;
 $db = (string) env('DB_DATABASE', '');
 if (!preg_match('/^mpay_test_[a-z0-9_]+$/D', $db) || env('MPAY_TEST_DATABASE') !== $db) throw new RuntimeException('Dedicated MPAY_TEST_DATABASE required');
 
-function routingFixture(int $stores = 2, int $offset = 0, int $mode = RouteConstant::ROUTE_MODE_FIRST_AVAILABLE, bool $self = false): array
+function routingFixture(int $stores = 2, int $offset = 0, int $mode = RouteConstant::ROUTE_MODE_AMOUNT_PRIORITY, bool $self = false): array
 {
     $seed = bin2hex(random_bytes(5));
     $uid = '2088' . str_pad((string) random_int(100000, 999999999999), 12, '0', STR_PAD_LEFT);

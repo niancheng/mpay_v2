@@ -96,11 +96,14 @@ class PayOrderAttemptService extends BaseService
             }
         }
 
-        $phases = $route['receipt_attempt_phases'] ?? [['allow_offset' => true, 'candidates' => $candidates]];
+        $amountPriority = (int) ($route['route_mode'] ?? -1) === RouteConstant::ROUTE_MODE_AMOUNT_PRIORITY;
+        $phases = $amountPriority
+            ? $route['receipt_attempt_phases']
+            : [['allow_offset' => true, 'candidates' => $candidates]];
         $productRejects = [];
         $amountRejects = [];
         $lastPayNo = '';
-        foreach ($route['receipt_deferred_candidates'] ?? [] as $candidate) {
+        foreach ($amountPriority ? ($route['receipt_deferred_candidates'] ?? []) : [] as $candidate) {
             $amountRejects[] = $this->receiptSkip($input, $candidate['channel'], false, $candidate['receipt_amount_message']);
         }
         foreach ($phases as $phase) {
@@ -111,7 +114,7 @@ class PayOrderAttemptService extends BaseService
                 $channel = $candidate['channel'];
                 $isStore = $channel->plugin_code === AlipayStoreReceiptRules::PLUGIN;
                 $scopeId = (int) $channel->api_config_id;
-                if ($isStore && isset($checkedScopes[$scopeId])) continue;
+                if ($amountPriority && $isStore && isset($checkedScopes[$scopeId])) continue;
                 $candidate['receipt_allow_offset'] = $allowOffset;
                 $route['selected_channel'] = $candidate;
 
@@ -130,6 +133,8 @@ class PayOrderAttemptService extends BaseService
                     $prepared = $this->createPayAttempt($input, $merchant, $merchantGroupId, $channel,
                         (int) ($route['poll_group']->id ?? 0), $route, $allowOffset);
                 } catch (ReceiptAmountOccupiedException $e) {
+                    // 仅新策略允许因金额占用换店；旧策略选定后按插件配置处理或报错。
+                    if (!$amountPriority) throw $e;
                     // The business order, pay order, fee freeze and attempt count have all rolled back.
                     $amountRejects[] = $this->receiptSkip($input, $channel, $allowOffset, $e->getMessage());
                     continue;
@@ -144,7 +149,7 @@ class PayOrderAttemptService extends BaseService
                             'channel_id' => (int) $channel->id,
                             'original_amount' => $payAmount,
                             'receipt_amount' => (int) $result['pay_order']->pay_amount,
-                            'phase' => $allowOffset ? 'offset_fallback' : 'original',
+                            'phase' => $amountPriority ? ($allowOffset ? 'offset_fallback' : 'original') : 'plugin_config',
                         ]);
                     }
                     return $result;

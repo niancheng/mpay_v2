@@ -44,12 +44,17 @@ Container::get(PaymentRouteService::class)->previewAvailablePayTypes((int) $f['g
 check(!Redis::exists($key) && routingCounts() === $counts, '两类预览不创建订单、占用或轮询游标');
 Redis::setex($key, 123, 1); routingOccupy($b);
 $preview = routingSnapshot($f);
-check((int) $preview['selected_channel']['channel_id'] === (int) $c->id && (int) Redis::get($key) === 1 && Redis::ttl($key) <= 123, '预览从下一游标环形跳过占用门店且不续期');
+check((int) $preview['selected_channel']['channel_id'] === (int) $b->id && (int) Redis::get($key) === 1 && Redis::ttl($key) <= 123, '旧顺序预览不感知占用，不推进或续期游标');
+routingRejects(fn () => routingAttempts()->preparePayAttempt(routingInput($f)), ReceiptAmountOccupiedException::class, '旧顺序轮到占用的 B 时拒绝，不自动换 C');
+check((int) Redis::get($key) === 2, '旧顺序正式请求只推进一次游标');
 $result = routingAttempts()->preparePayAttempt(routingInput($f));
-check((int) $result['pay_order']->channel_id === (int) $c->id && (int) Redis::get($key) === 2, 'B 占用后选 C 而非回到 A，正式请求只推进一次游标');
+check((int) $result['pay_order']->channel_id === (int) $c->id && (int) Redis::get($key) === 3, '下一笔旧顺序请求才轮到 C');
 
 $f = routingFixture(2, 1, RC::ROUTE_MODE_WEIGHTED); routingOccupy($f['channels'][0]);
-for ($i = 0; $i < 12; ++$i) check((int) routingSnapshot($f)['selected_channel']['channel_id'] === (int) $f['channels'][1]->id, '权重不允许占用门店的偏移抢在其他原金额前');
+for ($i = 0; $i < 12; ++$i) {
+    $route = routingSnapshot($f);
+    check(!isset($route['receipt_attempt_phases']) && count($route['candidates']) === 2, '旧权重保留完整合格候选，不进入金额优先分支');
+}
 
 // Same config shares amounts with all associated channels, even outside this poll group and disabled.
 $f = routingFixture(); [$a, $b] = $f['channels'];
@@ -157,10 +162,11 @@ Container::get(\app\service\payment\order\PayOrderCallbackService::class)->handl
 check((int) $order->fresh()->status === 2 && (int) $order->fresh()->pay_amount === 10000 && (int) $result['biz_order']->fresh()->paid_amount === 10000, '完整下单后用原监听协议回调成功，业务结算仍为原价');
 
 // No-store routes still use the old candidate contract; no receipt pre-check queries are needed.
-$f = routingFixture(); $channel = $f['channels'][0];
+$f = routingFixture(mode: RC::ROUTE_MODE_FIRST_AVAILABLE); $channel = $f['channels'][0];
 $legacy = PaymentPluginConf::create(['plugin_code' => R::LEGACY, 'config' => storeConfig(changes: ['bill_user_id' => '2088999999999998'])]);
 $channel->plugin_code = R::LEGACY; $channel->api_config_id = $legacy->id; $channel->save();
 $f['channels'][1]->status = 0; $f['channels'][1]->save();
 $route = routingSnapshot($f);
 check((int) $route['selected_channel']['channel_id'] === (int) $channel->id && !isset($route['receipt_attempt_phases']), '其他插件不进入门店金额分配两阶段流程');
+require __DIR__ . '/amount_priority_routing.php';
 echo "PASS: $checks full-route MySQL checks (synthetic payment evidence, no live Alipay)\n";

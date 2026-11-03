@@ -67,6 +67,7 @@ return [
             ['name' => '顺序依次轮询', 'value' => 0],
             ['name' => '权重随机轮询', 'value' => 1],
             ['name' => '默认启用通道', 'value' => 2],
+            ['name' => '金额优先轮询', 'value' => 3],
         ],
     ],
     'settlement_cycle_type' => [
