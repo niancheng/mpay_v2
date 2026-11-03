@@ -9,7 +9,8 @@ permissions:
 jobs:
   test:
     name: PHP ${{ matrix.php }} and MySQL receipt tests
-    runs-on: ubuntu-latest
+    # Match the pinned browser toolchain instead of following ubuntu-latest upgrades.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -60,8 +61,10 @@ jobs:
       - run: php tests/store_concurrency.php
       - run: php tests/store_routing.php
       - run: php tests/store_routing_concurrency.php
-      - name: Payment reuse and signed V1/V2 protocol regression
+      - name: Payment reuse state and signed V2 protocol regression
         run: php tests/payment_reuse.php
+      - name: Signed V1 submit and API reuse regression
+        run: php tests/payment_reuse_v1.php
       - name: Payment reuse cross-process concurrency regression
         run: php tests/payment_reuse_concurrency.php
       - uses: actions/setup-node@v4
@@ -98,7 +101,7 @@ jobs:
   publish:
     needs: test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
