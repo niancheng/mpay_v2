@@ -152,7 +152,23 @@ jobs:
           DIGEST: ${{ steps.publish.outputs.digest }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
+          set -euo pipefail
           docker buildx imagetools inspect "$IMAGE@$DIGEST"
-          MPAY_TEST_PLATFORM=linux/amd64 bash tests/docker_data_smoke.sh "$IMAGE@$DIGEST"
-          MPAY_TEST_PLATFORM=linux/arm64 bash tests/docker_data_smoke.sh "$IMAGE@$DIGEST"
-          printf 'Image: %s:%s\nDigest: %s\nBoth architecture data/JWT upgrade checks: passed\n' "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          # Pin each platform's own manifest: classic Docker stores cannot map the
+          # same multi-platform index digest to two different image configurations.
+          manifest="$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST")"
+          for arch in amd64 arm64; do
+            platform_digest="$(jq -er --arg arch "$arch" '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
+              | if length == 1 then .[0].digest else error("Expected exactly one manifest for " + $arch) end
+            ' <<< "$manifest")"
+            [[ "$platform_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            platform_image="$IMAGE@$platform_digest"
+            echo "Verifying linux/$arch: $platform_image"
+            docker pull --platform "linux/$arch" "$platform_image"
+            revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$platform_image")"
+            version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$platform_image")"
+            [[ "$revision" == "$GITHUB_SHA" && "$version" == "$VERSION" ]]
+            MPAY_TEST_PLATFORM="linux/$arch" bash tests/docker_data_smoke.sh "$platform_image"
+          done
+          printf 'Image: %s:%s\nDigest: %s\nBoth architecture revision/data/JWT upgrade checks: passed\n' "$IMAGE" "$VERSION" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
