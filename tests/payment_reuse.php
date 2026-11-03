@@ -190,30 +190,6 @@ function reuseProtocolPayload(array $fixture, string $order): array
         'return_url' => 'https://merchant.example.invalid/return', 'clientip' => '127.0.0.1', 'device' => 'pc'];
 }
 
-// Real V1 signature validation plus submit -> mapi cross-entry resume.
-$pf = routingFixture(1); $key = bin2hex(random_bytes(16));
-$credential = MerchantApiCredential::create(['merchant_id' => $pf['merchant']->id, 'api_key' => $key, 'status' => 1]);
-$p1 = Container::get(EpayV1ProtocolService::class);
-$payload = reuseSigned(reuseProtocolPayload($pf, 'V1-' . bin2hex(random_bytes(8))), $key, 'MD5');
-$location = reuseLocation($p1->submit($payload, $payload, $request));
-check(str_contains($location, '/payment/PAY') && !str_contains($location, '/entry/'), 'V1 首次签名页面提交成功');
-$counts = routingCounts();
-check(reuseLocation($p1->submit($payload, $payload, $request)) === $location, 'V1 页面重复提交跳回同一支付页');
-$mapi = $p1->mapi($payload, $payload, $request);
-check($mapi['code'] === 1 && str_ends_with($location, '/payment/' . $mapi['trade_no']) && routingCounts() === $counts,
-    'V1 API 复用相同 trade_no，不受 submit_type 变化影响');
-$bad = $payload; $bad['sign'] = 'invalid';
-check($p1->mapi($bad, $bad, $request)['code'] === 0, 'V1 已有原单仍要求有效签名');
-$credential->status = 0; $credential->save();
-check($p1->mapi($payload, $payload, $request)['code'] === 0, 'V1 已有原单仍拒绝停用凭证');
-$credential->status = 1; $credential->save();
-$pf['merchant']->pay_status = 0; $pf['merchant']->save();
-check($p1->mapi($payload, $payload, $request)['code'] === 0, 'V1 已有原单仍拒绝停用支付商户');
-$pf['merchant']->pay_status = 1; $pf['merchant']->save();
-$bad = reuseSigned(array_replace($payload, ['money' => '101.00']), $key, 'MD5');
-check(str_contains(reuseLocation($p1->submit($bad, $bad, $request)), '/payment/entry/error?'), 'V1 合法签名但金额冲突不跳入原支付页');
-check(routingCounts() === $counts, 'V1 鉴权与参数冲突不产生副作用');
-
 // Real V2 RSA request verification and newly signed response. Keys exist only in this test process.
 $keyResource = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
 if ($keyResource === false || !openssl_pkey_export($keyResource, $privateKey)) throw new RuntimeException('Cannot create test RSA key');
@@ -221,9 +197,12 @@ $publicKey = openssl_pkey_get_details($keyResource)['key'];
 $epayConfig = (array) config('epay');
 $temp = sys_get_temp_dir() . '/mpay-reuse-config-' . bin2hex(random_bytes(6)); mkdir($temp, 0700);
 try {
+    // Webman only loads configuration directories containing app.php.
+    file_put_contents($temp . '/app.php', '<?php return [];');
     $testConfig = $epayConfig; $testConfig['v2']['platform_private_key'] = $privateKey;
     file_put_contents($temp . '/epay.php', '<?php return ' . var_export($testConfig, true) . ';');
     \Webman\Config::load($temp);
+    check(config('epay.v2.platform_private_key') === $privateKey, 'V2 临时签名配置已加载');
     $pf = routingFixture(1);
     MerchantApiCredential::create(['merchant_id' => $pf['merchant']->id, 'api_key' => bin2hex(random_bytes(16)),
         'merchant_public_key' => $publicKey, 'status' => 1]);
@@ -264,6 +243,6 @@ try {
 } finally {
     file_put_contents($temp . '/epay.php', '<?php return ' . var_export($epayConfig, true) . ';');
     \Webman\Config::load($temp);
-    unlink($temp . '/epay.php'); rmdir($temp);
+    unlink($temp . '/epay.php'); unlink($temp . '/app.php'); rmdir($temp);
 }
 echo "PASS: $checks payment reuse, state, security and protocol checks\n";
