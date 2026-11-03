@@ -96,7 +96,8 @@ $account = MerchantAccount::where('merchant_id', $f['merchant']->id)->first();
 $after = routingCounts();
 check((int) $account->available_balance === 999500 && (int) $account->frozen_balance === 500 && $after[2] - $before[2] === 1 && $after[3] - $before[3] === 1, '多次冲突回滚只保留最终一份服务费冻结和资金流水');
 $meta = $result['pay_order']->ext_json['personal_receipt'];
-routingRejects(fn () => $service->preparePayAttempt($input), ConflictException::class, '重复业务请求沿用活跃支付单保护，不重新分配门店');
+$reused = $service->preparePayAttempt($input);
+check($reused['reused'] && $reused['pay_order']->pay_no === $result['pay_order']->pay_no, '重复业务请求恢复原单，不重新分配门店');
 check(PayOrder::where('biz_no', $biz->biz_no)->count() === 1 && $result['pay_order']->fresh()->ext_json['personal_receipt'] === $meta, '重复请求没有额外冻结或更改旧快照');
 
 $f = routingFixture(3, 0, self: true); $snapshot = routingSnapshot($f); $input = routingInput($f);
@@ -160,6 +161,14 @@ $record = testFlow('ROUTE-CALLBACK-' . bin2hex(random_bytes(5)), ['bill_user_id'
     'candidate_channel_id' => (int) $a->id, 'candidate_pay_no' => (string) $order->pay_no, 'price' => '100.01', 'created_at' => time(), 'paid_at' => time()]);
 Container::get(\app\service\payment\order\PayOrderCallbackService::class)->handleChannelNotifyPayload((int) $a->id, ['record' => $record]);
 check((int) $order->fresh()->status === 2 && (int) $order->fresh()->pay_amount === 10000 && (int) $result['biz_order']->fresh()->paid_amount === 10000, '完整下单后用原监听协议回调成功，业务结算仍为原价');
+
+$callbackCounts = routingCounts();
+Container::get(\app\service\payment\order\PayOrderCallbackService::class)->handleChannelNotifyPayload((int) $a->id, ['record' => $record]);
+check(routingCounts() === $callbackCounts, '重复到账通知不重复生成资金流水');
+$paidInput = routingInput($f, (string) $result['biz_order']->merchant_order_no);
+$paidResume = routingAttempts()->preparePayAttempt($paidInput);
+check($paidResume['reused'] && $paidResume['pay_order']->pay_no === $order->pay_no && routingCounts() === $callbackCounts,
+    '真实本地到账链路成功后，同号请求恢复结果，不重复收款或通知');
 
 // No-store routes still use the old candidate contract; no receipt pre-check queries are needed.
 $f = routingFixture(mode: RC::ROUTE_MODE_FIRST_AVAILABLE); $channel = $f['channels'][0];

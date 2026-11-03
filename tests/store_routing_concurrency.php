@@ -121,7 +121,7 @@ check($after[0] - $before[0] === 2 && $after[1] - $before[1] === 2 && $after[2] 
 
 $f = routingFixture(2, 0, self: true); $before = routingCounts();
 $outcomes = concurrentRoutes($f, 2, sameOrder: true); $statuses = array_count_values(array_column($outcomes, 'status'));
-check(($statuses['accepted'] ?? 0) === 1 && ($statuses['conflict'] ?? 0) === 1, '相同商户订单号并发只创建一笔支付尝试，另一笔触发已有幂等保护');
+check(($statuses['accepted'] ?? 0) === 2 && count(array_unique(array_column($outcomes, 'pay_no'))) === 1, '相同商户订单号并发恢复同一支付单，只创建一笔支付尝试');
 $after = routingCounts();
 check($after[0] - $before[0] === 1 && $after[1] - $before[1] === 1 && $after[2] - $before[2] === 1 && $after[3] - $before[3] === 1, '重复请求不会在第二家门店创建第二份占用或冻结');
 echo "PASS: $checks full-route cross-process MySQL concurrency checks\n";

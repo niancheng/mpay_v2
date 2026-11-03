@@ -9,7 +9,8 @@ permissions:
 jobs:
   test:
     name: PHP ${{ matrix.php }} and MySQL receipt tests
-    runs-on: ubuntu-latest
+    # Match the pinned browser toolchain instead of following ubuntu-latest upgrades.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -60,6 +61,25 @@ jobs:
       - run: php tests/store_concurrency.php
       - run: php tests/store_routing.php
       - run: php tests/store_routing_concurrency.php
+      - name: Payment reuse state and signed V2 protocol regression
+        run: php tests/payment_reuse.php
+      - name: Signed V1 submit and API reuse regression
+        run: php tests/payment_reuse_v1.php
+      - name: Payment reuse cross-process concurrency regression
+        run: php tests/payment_reuse_concurrency.php
+      - uses: actions/setup-node@v4
+        if: matrix.php == '8.3'
+        with:
+          node-version: '22'
+      - name: Read-only waiting page regression
+        if: matrix.php == '8.3'
+        run: node --test tests/payment_waiting.test.cjs
+      - name: Actual cashier browser regression (desktop and mobile)
+        if: matrix.php == '8.3'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mpay-browser" --no-save --ignore-scripts --no-audit --no-fund playwright@1.55.0
+          "$RUNNER_TEMP/mpay-browser/node_modules/.bin/playwright" install --with-deps chromium
+          MPAY_PLAYWRIGHT_PATH="$RUNNER_TEMP/mpay-browser/node_modules/playwright" node tests/payment_waiting_browser.cjs
       - name: Build and smoke-test container
         if: matrix.php == '8.3'
         run: |
@@ -81,7 +101,7 @@ jobs:
   publish:
     needs: test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read

@@ -22,6 +22,7 @@ use app\service\merchant\MerchantService;
 use app\service\payment\config\PaymentTypeService;
 use app\service\payment\identity\PaymentIdentityService;
 use app\service\payment\order\PayOrderService;
+use app\service\payment\order\PayOrderReuseService;
 use app\service\payment\runtime\MerchantNotifyDispatcherService;
 use app\service\payment\runtime\PaymentRouteService;
 use app\service\system\config\SystemPublicConfigService;
@@ -92,7 +93,7 @@ class CashierService extends BaseService
 
         $activePayOrder = $this->resolveActivePayOrder($bizOrder);
         $paySwitchEnabled = (int) ($merchant->pay_status ?? CommonConstant::STATUS_ENABLED) === CommonConstant::STATUS_ENABLED;
-        $canPay = $paySwitchEnabled && !in_array((int) $bizOrder->status, [
+        $canPay = $paySwitchEnabled && !PayOrderReuseService::hasExpired($bizOrder->expire_at) && !in_array((int) $bizOrder->status, [
             TradeConstant::ORDER_STATUS_SUCCESS,
             TradeConstant::ORDER_STATUS_CLOSED,
             TradeConstant::ORDER_STATUS_TIMEOUT,
@@ -148,13 +149,7 @@ class CashierService extends BaseService
         // 先恢复业务单，再把用户选中的支付方式转成一次明确的支付尝试。
         $merchant = $this->merchantService->ensureMerchantPayEnabled((int) $bizOrder->merchant_id);
         $this->merchantService->ensureMerchantGroupEnabled((int) $merchant->group_id);
-        $activePayOrder = $this->resolveActivePayOrder($bizOrder);
-        if ($activePayOrder && in_array((int) $activePayOrder->status, [
-            TradeConstant::ORDER_STATUS_CREATED,
-            TradeConstant::ORDER_STATUS_PAYING,
-        ], true)) {
-            throw new ValidationException('当前订单已有进行中的支付尝试');
-        }
+        // 同方式重复确认由公共发起层恢复原单；不同方式仍由公共层明确拒绝。
 
         $paymentType = $this->paymentTypeService->findByCode($typeCode);
         if (!$paymentType || (int) $paymentType->status !== CommonConstant::STATUS_ENABLED) {
@@ -184,6 +179,7 @@ class CashierService extends BaseService
      * 使用已获取的用户身份继续收银台支付。
      *
      * @param array<string, mixed> $input 请求参数
+     * @param Request $request 请求对象
      * @return array<string, mixed> 支付发起结果
      */
     public function resumeIdentity(array $input): array
@@ -331,15 +327,7 @@ class CashierService extends BaseService
             (int) $input['merchant_id'],
             (string) $input['merchant_order_no']
         );
-        if ($bizOrder) {
-            $activePayOrder = $this->resolveActivePayOrder($bizOrder);
-            if ($activePayOrder && in_array((int) $activePayOrder->status, [
-                TradeConstant::ORDER_STATUS_CREATED,
-                TradeConstant::ORDER_STATUS_PAYING,
-            ], true)) {
-                throw new ValidationException('当前订单已有进行中的支付尝试');
-            }
-        }
+        // 保留 token 与身份校验，公共发起层校验原单通道/身份后决定复用。
 
         $attempt = $this->payOrderService->preparePayAttemptByChannel($input, $channel);
         try {
@@ -402,7 +390,7 @@ class CashierService extends BaseService
      *
      * @param string $token 身份流程令牌
      * @param string $provider 授权平台
-     * @param Throwable $e 授权或续跑异常
+     * @param Throwable $e 异常
      * @param array<string, mixed>|null $context 已成功获取身份的流程上下文，未取得身份时为 null
      * @return Response 禁止缓存的失败承接页跳转
      */
@@ -503,7 +491,10 @@ class CashierService extends BaseService
 
         $merchant = $this->merchantService->ensureMerchantEnabled((int) $payOrder->merchant_id);
         $paymentType = $this->paymentTypeService->findById((int) $payOrder->pay_type_id);
-        $presentation = $this->resolvePresentation($payOrder);
+        if ((int) $bizOrder->merchant_id !== (int) $payOrder->merchant_id) {
+            throw new BusinessStateException('支付订单归属异常，请联系商户核实');
+        }
+        $presentation = $this->resolvePresentation($payOrder, $bizOrder);
         $returnUrl = (int) $payOrder->status === TradeConstant::ORDER_STATUS_SUCCESS
             ? $this->merchantNotifyDispatcherService->buildPaySuccessReturnUrl($payOrder, $bizOrder)
             : (string) ($payOrder->return_url ?: $bizOrder->return_url);
@@ -535,6 +526,9 @@ class CashierService extends BaseService
                 'icon' => (string) ($paymentType->icon ?? ''),
             ],
             'presentation' => $presentation,
+            // 只读标记，资料到达时即使 status 仍为支付中，等待页也能恢复原二维码。
+            'presentation_pending' => ($presentation['pay_page'] ?? '') === 'page'
+                && ($presentation['pay_params']['_page'] ?? '') === 'paymentPending',
             'cashier_path' => $this->buildCashierPath((string) $payOrder->biz_no),
             'payment_path' => $this->buildPaymentPagePath((string) $payOrder->pay_no),
             'public_config' => $this->systemPublicConfigService->cashier(),
@@ -622,7 +616,12 @@ class CashierService extends BaseService
             return null;
         }
 
-        return $this->payOrderRepository->findByPayNo($activePayNo);
+        $payOrder = $this->payOrderRepository->findByPayNo($activePayNo);
+        if (!$payOrder || (string) $payOrder->biz_no !== (string) $bizOrder->biz_no
+            || (int) $payOrder->merchant_id !== (int) $bizOrder->merchant_id) {
+            throw new BusinessStateException('原支付单数据异常，请联系商户核实');
+        }
+        return $payOrder;
     }
 
     /**
@@ -746,17 +745,22 @@ class CashierService extends BaseService
      * @param PayOrder $payOrder 支付单
      * @return array<string, mixed>
      */
-    private function resolvePresentation(PayOrder $payOrder): array
+    private function resolvePresentation(PayOrder $payOrder, ?BizOrder $bizOrder = null): array
     {
         $extJson = (array) ($payOrder->ext_json ?? []);
         $presentation = (array) ($extJson['presentation'] ?? []);
         $status = (int) $payOrder->status;
-        if (in_array($status, [
-            TradeConstant::ORDER_STATUS_FAILED,
-            TradeConstant::ORDER_STATUS_CLOSED,
-            TradeConstant::ORDER_STATUS_TIMEOUT,
-        ], true)) {
+        if (TradeConstant::isOrderTerminalStatus($status)) {
+            // 成功同样移除旧付款资料；前端继续依据数据库状态显示成功页。
             $presentation = $this->buildOrderStatePresentation($payOrder);
+        } elseif (!PayOrderReuseService::canPresent($payOrder, $bizOrder)) {
+            $expired = PayOrderReuseService::hasExpired($payOrder->expire_at)
+                || ($bizOrder && PayOrderReuseService::hasExpired($bizOrder->expire_at));
+            $presentation = ['pay_page' => 'error', 'pay_params' => [
+                'error_msg' => $expired
+                    ? '订单付款有效期已结束，请勿继续付款，请返回商户核实订单。'
+                    : '当前支付单已不可继续付款，请返回商户核实订单。',
+            ]];
         } elseif (trim((string) ($presentation['pay_page'] ?? '')) === '') {
             $presentation = $this->buildOrderStatePresentation($payOrder);
         }
@@ -809,14 +813,14 @@ class CashierService extends BaseService
         if ($status === TradeConstant::ORDER_STATUS_CLOSED) {
             return [
                 'pay_page' => 'error',
-                'pay_params' => ['error_msg' => '支付订单已关闭，请返回收银台重新发起支付。'],
+                'pay_params' => ['error_msg' => '支付订单已关闭，请返回商户查看订单。'],
             ];
         }
 
         if ($status === TradeConstant::ORDER_STATUS_TIMEOUT) {
             return [
                 'pay_page' => 'error',
-                'pay_params' => ['error_msg' => '支付订单已超时，请返回收银台重新发起支付。'],
+                'pay_params' => ['error_msg' => '支付订单已超时，请返回商户查看订单。'],
             ];
         }
 
