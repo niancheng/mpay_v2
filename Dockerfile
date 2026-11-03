@@ -14,7 +14,7 @@ COPY composer.json composer.lock ./
 RUN composer install --no-dev --no-interaction --prefer-dist --no-scripts --no-progress
 
 FROM base AS runtime
-ARG VERSION=store-bill-1.1.0
+ARG VERSION=store-bill-1.2.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="mpay_v2" \
       org.opencontainers.image.description="MPAY V2 with Alipay store bill receipt support" \

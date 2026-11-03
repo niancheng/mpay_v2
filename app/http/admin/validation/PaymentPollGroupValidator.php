@@ -21,7 +21,7 @@ class PaymentPollGroupValidator extends Validator
         'keyword' => 'sometimes|string|max:128',
         'group_name' => 'sometimes|string|min:2|max:100',
         'pay_type_id' => 'sometimes|integer|min:1|exists:ma_payment_type,id',
-        'route_mode' => 'sometimes|integer|in:0,1,2',
+        'route_mode' => 'sometimes|integer|in:0,1,2,3',
         'status' => 'sometimes|integer|in:0,1',
         'remark' => 'nullable|string|max:500',
         'page' => 'sometimes|integer|min:1',

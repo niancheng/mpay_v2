@@ -45,6 +45,12 @@ final class RouteConstant
     public const ROUTE_MODE_FIRST_AVAILABLE = 2;
 
     /**
+     * 原金额优先；每次按编排顺序从头尝试，全部占用后按插件配置兜底。
+     * 当前仅支持支付宝门店账单，不使用轮询游标、权重或默认标记。
+     */
+    public const ROUTE_MODE_AMOUNT_PRIORITY = 3;
+
+    /**
      * 获取通道类型名称映射。
      *
      * @return array<int, string> 通道类型名称表
@@ -81,6 +87,7 @@ final class RouteConstant
             self::ROUTE_MODE_ORDER => '顺序依次轮询',
             self::ROUTE_MODE_WEIGHTED => '权重随机轮询',
             self::ROUTE_MODE_FIRST_AVAILABLE => '默认启用通道',
+            self::ROUTE_MODE_AMOUNT_PRIORITY => '金额优先轮询',
         ];
     }
 }

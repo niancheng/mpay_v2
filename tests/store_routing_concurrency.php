@@ -96,7 +96,7 @@ function concurrentRoutes(array $fixture, int $count, bool $sameOrder = false): 
     }
 }
 
-$f = routingFixture(3, 1, RouteConstant::ROUTE_MODE_ORDER, self: true);
+$f = routingFixture(3, 1, RouteConstant::ROUTE_MODE_AMOUNT_PRIORITY, self: true);
 $before = routingCounts();
 $outcomes = concurrentRoutes($f, 6);
 check(array_count_values(array_column($outcomes, 'status')) === ['accepted' => 6], '六个进程先完成预检，再并发向三家门店申请，均在原金额或一分偏移内成功');

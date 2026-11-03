@@ -2,7 +2,7 @@
 # 作者 v2.1.2 的 /data 部署可保留原 Compose，仅修改镜像；见 docs/DOCKER_DATA.md。
 services:
   mpay:
-    image: ghcr.io/niancheng/mpay_v2:store-bill-1.1.0
+    image: ghcr.io/niancheng/mpay_v2:store-bill-1.2.0
     restart: unless-stopped
     init: true
     ports:

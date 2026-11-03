@@ -7,9 +7,6 @@ use app\common\constant\CommonConstant;
 use app\common\constant\RouteConstant;
 use app\common\util\FormatHelper;
 use app\exception\BusinessStateException;
-use app\exception\ReceiptAmountOccupiedException;
-use app\service\payment\receipt\AlipayStoreReceiptAllocationService;
-use app\service\payment\receipt\AlipayStoreReceiptRules;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
 use Throwable;
@@ -63,7 +60,7 @@ class PaymentRouteResolverService extends BaseService
         protected PaymentPluginRepository $paymentPluginRepository,
         protected PaymentTypeRepository $paymentTypeRepository,
         protected MerchantPolicyRepository $merchantPolicyRepository,
-        protected AlipayStoreReceiptAllocationService $storeReceiptAllocationService
+        protected AmountPriorityRouteStrategy $amountPriorityRouteStrategy
     ) {
     }
 
@@ -350,58 +347,23 @@ class PaymentRouteResolverService extends BaseService
         // 剩余候选再按轮询组策略排序，最终只从排序结果里挑一条。
         $ordered = $this->sortCandidates($eligible, $routeMode);
         $preview = !empty($context['_preview']);
-        $hasStoreReceipt = false;
-        foreach ($ordered as $candidate) {
-            if ($candidate['channel']->plugin_code === AlipayStoreReceiptRules::PLUGIN) $hasStoreReceipt = true;
-        }
-        if (!$hasStoreReceipt) {
-            // No store plugin in this route: preserve the existing selection/fallback contract.
-            return [
-                'available' => true,
+        // 独立策略入口；旧策略不探测金额、不因门店插件自动改变候选顺序。
+        if ($routeMode === RouteConstant::ROUTE_MODE_AMOUNT_PRIORITY) {
+            return $this->amountPriorityRouteStrategy->resolve($ordered, $payAmount, $preview, [
                 'poll_group' => $pollGroup,
                 'route_preference' => $routePreference,
-                'candidates' => $ordered,
                 'rejected_candidates' => $rejected,
-                'selected_channel' => $this->selectChannel($ordered, $routeMode, $cursorKey, $preview),
-            ];
+            ]);
         }
 
-        // Consume at most one cursor position, then keep that order through both phases.
-        $ordered = $this->orderReceiptAttempts($ordered, $routeMode, $cursorKey, $preview);
-        $plan = $this->storeReceiptAllocationService->preview($ordered, $payAmount);
-        $rejected = array_merge($rejected, $plan['rejected']);
-        $candidates = [];
-        foreach (array_merge($plan['original'], $plan['offset']) as $candidate) {
-            $candidates[(int) $candidate['channel_id']] ??= $candidate;
-        }
-        $selected = $plan['original'][0] ?? $plan['offset'][0] ?? null;
-        if ($selected !== null) $selected['receipt_allow_offset'] = $plan['original'] === [];
-        $result = [
-            'available' => $selected !== null,
+        return [
+            'available' => true,
             'poll_group' => $pollGroup,
             'route_preference' => $routePreference,
-            'candidates' => array_values($candidates),
+            'candidates' => $ordered,
             'rejected_candidates' => $rejected,
-            'selected_channel' => $selected,
-            'receipt_deferred_candidates' => $plan['deferred'],
-            'receipt_attempt_phases' => [
-                ['allow_offset' => false, 'candidates' => $plan['original']],
-                ['allow_offset' => true, 'candidates' => $plan['offset']],
-            ],
+            'selected_channel' => $this->selectChannel($ordered, $routeMode, $cursorKey, $preview),
         ];
-        if ($selected === null) {
-            $error = new ReceiptAmountOccupiedException(data: [
-                'poll_group_id' => $pollGroup ? (int) $pollGroup->id : 0,
-                'merchant_group_id' => $merchantGroupId,
-                'pay_type_id' => $payTypeId,
-                'original_amount' => $payAmount,
-                'reject_reasons' => $this->uniqueRejectedReasons($rejected),
-            ]);
-            if (!$preview) throw $error;
-            $result['reason'] = $error->getMessage();
-            $result['reason_code'] = 'receipt_amount_occupied';
-        }
-        return $result;
     }
 
     /**
@@ -722,24 +684,6 @@ class PaymentRouteResolverService extends BaseService
         });
 
         return $candidates;
-    }
-
-    /** Preserve circular order, or weighted sampling without replacement, across store skips. */
-    private function orderReceiptAttempts(array $candidates, int $routeMode, string $cursorKey, bool $preview): array
-    {
-        if ($routeMode === RouteConstant::ROUTE_MODE_WEIGHTED) {
-            $ordered = [];
-            while ($candidates !== []) {
-                $selected = $this->selectWeightedChannel($candidates);
-                $ordered[] = $selected;
-                $candidates = array_values(array_filter($candidates, static fn ($candidate) =>
-                    (int) $candidate['channel_id'] !== (int) $selected['channel_id']));
-            }
-            return $ordered;
-        }
-        $selected = $this->selectChannel($candidates, $routeMode, $cursorKey, $preview);
-        $index = (int) array_search((int) $selected['channel_id'], array_column($candidates, 'channel_id'), true);
-        return array_merge(array_slice($candidates, $index), array_slice($candidates, 0, $index));
     }
 
     /**

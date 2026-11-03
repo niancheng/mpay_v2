@@ -80,11 +80,11 @@ class MerchantPortalRoutePreviewService extends BaseService
                 (int) $merchant['merchant_group_id'],
                 $payTypeId,
                 $payAmount,
-                ['stat_date' => $statDate, 'merchant_id' => $merchantId]
+                ['stat_date' => $statDate, 'merchant_id' => $merchantId, '_preview' => true]
             );
 
-            $response['available'] = true;
-            $response['reason'] = '路由解析成功';
+            $response['available'] = (bool) ($resolved['available'] ?? false);
+            $response['reason'] = (string) ($resolved['reason'] ?? '路由解析成功');
             // 把模型和仓库返回的对象统一整理成前端可直接展示的数组结构。
             $response['bind'] = $this->normalizeBind($resolved['bind'] ?? null);
             $response['poll_group'] = $this->normalizePollGroup($resolved['poll_group'] ?? null);
