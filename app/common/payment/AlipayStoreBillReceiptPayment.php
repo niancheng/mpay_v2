@@ -13,6 +13,7 @@ use app\repository\payment\trade\PayOrderRepository;
 use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\config\PaymentTypeRepository;
 use app\service\payment\receipt\AlipayReceiptGuard as Guard;
+use app\service\payment\receipt\AlipayStoreReceiptAllocationService;
 use app\service\payment\receipt\AlipayStoreReceiptRules as Rules;
 use support\Db;
 use support\Request;
@@ -57,39 +58,8 @@ class AlipayStoreBillReceiptPayment extends AlipayBillReceiptPayment
     private function prepareAndPresent(array $order): array
     {
         $payNo = (string) ($order['pay_no'] ?? '');
-        $meta = Guard::atomic(function () use ($payNo) {
-            $this->assertLiveConfig();
-            Guard::topology();
-            $row = $this->lockedPayOrder($payNo);
-            if (!in_array((int) $row->status, TradeConstant::orderMutableStatuses(), true)) Rules::fail('支付单状态不允许重新分配金额');
-            if (!in_array((int) $row->channel_id, $this->receiptChannelIds(), true)) Rules::fail('支付单不属于当前收款配置');
-            $ext = (array) ($row->ext_json ?? []);
-            if (isset($ext['personal_receipt'])) {
-                $meta = (array) $ext['personal_receipt'];
-                if (($meta['platform'] ?? '') !== Rules::PLUGIN || ($meta['bill_user_id'] ?? '') !== $this->getConfig('bill_user_id') || ($meta['store_no'] ?? '') !== $this->getConfig('store_no')) Rules::fail('支付单门店快照不一致');
-                if (Rules::timestamp($meta['expire_at'] ?? null) <= time()) Rules::fail('支付单已过期，请重新下单');
-                return $meta; // Do not extend expiry, change amount or replace the QR on refresh.
-            }
-            $original = $this->originalAmount($row);
-            if ($original <= 0) Rules::fail('支付单金额必须大于零');
-            $used = $this->payOrderRepository->listUsedStoreReceiptAmounts($this->receiptChannelIds(), $payNo, Rules::date(time()));
-            $amount = Rules::allocate($original, $used, $this->amountOffsetMax());
-            $start = Rules::timestamp((string) $row->request_at);
-            $expires = time() + $this->receiptValidSeconds();
-            if ($row->expire_at) $expires = min($expires, Rules::timestamp((string) $row->expire_at));
-            if ($expires <= time() || $start > time() + 5) Rules::fail('支付单识别时间无效');
-            $meta = ['platform' => Rules::PLUGIN, 'mode' => 'amount', 'bill_user_id' => $this->getConfig('bill_user_id'),
-                'store_no' => $this->getConfig('store_no'), 'original_amount' => $original, 'receipt_amount' => $amount,
-                'offset_amount' => $amount - $original, 'request_at' => (string) $row->request_at, 'expire_at' => Rules::date($expires),
-                'qrcode' => trim((string) $this->getConfig('receipt_qrcode_content', '')), 'qrcode_image' => trim((string) $this->getConfig('receipt_qrcode_image', ''))];
-            $ext['personal_receipt'] = $meta;
-            $ext['receipt_watcher'] = array_diff_key($meta, array_flip(['qrcode', 'qrcode_image']));
-            $row->ext_json = $ext;
-            $row->pay_amount = $amount;
-            $row->expire_at = $meta['expire_at'];
-            $row->save();
-            return $meta;
-        });
+        $meta = (new AlipayStoreReceiptAllocationService($this->payOrderRepository))
+            ->prepareForPresentation($payNo, $this->channelConfig);
         $params = ['_page' => 'receiptQrcode', 'amount' => FormatHelper::amount((int) $meta['receipt_amount']),
             'original_amount' => FormatHelper::amount((int) $meta['original_amount']), 'receipt_match_mode' => 'amount',
             'receipt_valid_seconds' => $this->receiptValidSeconds(), 'expire_at' => $meta['expire_at'],

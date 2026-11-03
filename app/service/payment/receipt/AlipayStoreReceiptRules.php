@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace app\service\payment\receipt;
 
 use app\exception\PaymentException;
+use app\exception\ReceiptAmountOccupiedException;
 use DateTimeImmutable;
 use DateTimeZone;
 
@@ -104,12 +105,22 @@ final class AlipayStoreReceiptRules
             self::timestamp($meta['expire_at'] ?? null) >= $flow['paid_at'];
     }
 
-    public static function allocate(int $original, array $used, int $maxOffset): int
+    /** A read-only probe and the authoritative allocator share exactly the same arithmetic. */
+    public static function availableAmount(int $original, array $used, int $maxOffset): ?int
     {
+        if ($original <= 0 || $maxOffset < 0 || $maxOffset > 99) self::fail('门店金额分配参数不合法');
         $occupied = array_fill_keys($used, true);
         for ($offset = 0; $offset <= $maxOffset; ++$offset) {
             if (!isset($occupied[$original + $offset])) return $original + $offset;
         }
-        self::fail('当前门店该金额已被占用，可用金额偏移已用尽');
+        return null;
+    }
+
+    public static function allocate(int $original, array $used, int $maxOffset): int
+    {
+        return self::availableAmount($original, $used, $maxOffset)
+            ?? throw new ReceiptAmountOccupiedException('当前门店该金额已被占用，可用金额偏移已用尽', [
+                'original_amount' => $original, 'amount_offset_max' => $maxOffset,
+            ]);
     }
 }
