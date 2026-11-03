@@ -60,6 +60,23 @@ jobs:
       - run: php tests/store_concurrency.php
       - run: php tests/store_routing.php
       - run: php tests/store_routing_concurrency.php
+      - name: Payment reuse and signed V1/V2 protocol regression
+        run: php tests/payment_reuse.php
+      - name: Payment reuse cross-process concurrency regression
+        run: php tests/payment_reuse_concurrency.php
+      - uses: actions/setup-node@v4
+        if: matrix.php == '8.3'
+        with:
+          node-version: '22'
+      - name: Read-only waiting page regression
+        if: matrix.php == '8.3'
+        run: node --test tests/payment_waiting.test.cjs
+      - name: Actual cashier browser regression (desktop and mobile)
+        if: matrix.php == '8.3'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mpay-browser" --no-save --ignore-scripts --no-audit --no-fund playwright@1.55.0
+          "$RUNNER_TEMP/mpay-browser/node_modules/.bin/playwright" install --with-deps chromium
+          MPAY_PLAYWRIGHT_PATH="$RUNNER_TEMP/mpay-browser/node_modules/playwright" node tests/payment_waiting_browser.cjs
       - name: Build and smoke-test container
         if: matrix.php == '8.3'
         run: |

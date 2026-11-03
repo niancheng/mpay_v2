@@ -16,6 +16,7 @@ use app\service\payment\receipt\AlipayReceiptGuard;
 use app\service\payment\receipt\AlipayStoreReceiptAllocationService;
 use app\service\payment\receipt\AlipayStoreReceiptRules;
 use support\Log;
+use Illuminate\Database\QueryException;
 use app\exception\ValidationException;
 use app\model\merchant\Merchant;
 use app\model\payment\BizOrder;
@@ -66,7 +67,8 @@ class PayOrderAttemptService extends BaseService
         protected PaymentTypeRepository $paymentTypeRepository,
         protected PaymentIdentityService $paymentIdentityService,
         protected PayOrderChannelDispatchService $payOrderChannelDispatchService,
-        protected AlipayStoreReceiptAllocationService $storeReceiptAllocationService
+        protected AlipayStoreReceiptAllocationService $storeReceiptAllocationService,
+        protected PayOrderReuseService $payOrderReuseService
     ) {}
 
     /**
@@ -87,7 +89,17 @@ class PayOrderAttemptService extends BaseService
         [$merchant, $merchantGroupId] = $this->resolveMerchantContext($merchantId);
 
         $this->ensurePaymentTypeEnabled($payTypeId);
-        $route = $this->paymentRouteService->resolveByMerchantGroup($merchantGroupId, $payTypeId, $payAmount, $input);
+        $reused = $this->payOrderReuseService->findReusable($input, $merchant);
+        if ($reused !== null) return $reused;
+
+        try {
+            $route = $this->paymentRouteService->resolveByMerchantGroup($merchantGroupId, $payTypeId, $payAmount, $input);
+        } catch (\Webman\Exception\BusinessException $e) {
+            // 路由预览期间另一请求可能已建单。只恢复合法原单，不掩盖其他故障。
+            $reused = $this->payOrderReuseService->findReusable($input, $merchant);
+            if ($reused !== null) return $reused;
+            throw $e;
+        }
         $selected = (array) $route['selected_channel'];
         $candidates = [$selected];
         foreach ((array) ($route['candidates'] ?? []) as $candidate) {
@@ -125,7 +137,9 @@ class PayOrderAttemptService extends BaseService
                     $productRejects[] = ['channel_id' => (int) $channel->id, 'channel_name' => (string) $channel->name, 'reason' => $e->getMessage()];
                     continue;
                 }
-                if ($identityFlow !== null) return $identityFlow;
+                if ($identityFlow !== null) {
+                    return $this->payOrderReuseService->findReusable($input, $merchant) ?? $identityFlow;
+                }
 
                 if ($isStore) $checkedScopes[$scopeId] = true;
                 try {
@@ -133,6 +147,8 @@ class PayOrderAttemptService extends BaseService
                     $prepared = $this->createPayAttempt($input, $merchant, $merchantGroupId, $channel,
                         (int) ($route['poll_group']->id ?? 0), $route, $allowOffset);
                 } catch (ReceiptAmountOccupiedException $e) {
+                    $reused = $this->payOrderReuseService->findReusable($input, $merchant);
+                    if ($reused !== null) return $reused;
                     // 仅新策略允许因金额占用换店；旧策略选定后按插件配置处理或报错。
                     if (!$amountPriority) throw $e;
                     // The business order, pay order, fee freeze and attempt count have all rolled back.
@@ -142,7 +158,7 @@ class PayOrderAttemptService extends BaseService
 
                 try {
                     $result = $this->dispatchPayAttempt($prepared, $channel, $merchant);
-                    if ($isStore) {
+                    if ($isStore && $result['created']) {
                         Log::info('支付宝门店金额分配成功', [
                             'merchant_order_no' => (string) $input['merchant_order_no'],
                             'pay_no' => (string) $result['pay_order']->pay_no,
@@ -160,6 +176,9 @@ class PayOrderAttemptService extends BaseService
                 }
             }
         }
+
+        $reused = $this->payOrderReuseService->findReusable($input, $merchant);
+        if ($reused !== null) return $reused;
 
         if ($amountRejects !== [] && $productRejects === []) {
             throw new ReceiptAmountOccupiedException(data: ['pay_type_id' => $payTypeId,
@@ -214,6 +233,8 @@ class PayOrderAttemptService extends BaseService
         }
 
         $this->ensurePaymentTypeEnabled($payTypeId);
+        $reused = $this->payOrderReuseService->findReusable($input, $merchant, (int) $channel->id);
+        if ($reused !== null) return $reused;
 
         $route = [
             'poll_group' => null,
@@ -225,7 +246,7 @@ class PayOrderAttemptService extends BaseService
         ];
         $identityFlow = $this->paymentIdentityService->inspect($input, $merchant, $channel, $route);
         if ($identityFlow !== null) {
-            return $identityFlow;
+            return $this->payOrderReuseService->findReusable($input, $merchant, (int) $channel->id) ?? $identityFlow;
         }
 
         return $this->dispatchPayAttempt(
@@ -255,15 +276,24 @@ class PayOrderAttemptService extends BaseService
         $bizFields['ext_json'] = (array) ($bizFields['ext_json'] ?? []);
         unset($bizFields['ext_json']['payment'], $bizFields['ext_json']['presentation']);
 
-        $bizOrder = $this->transactionRetry(function () use ($merchantId, $merchantOrderNo, $payAmount, $bizFields) {
-            return $this->prepareCashierBizOrderInCurrentTransaction($merchantId, $merchantOrderNo, $payAmount, $bizFields);
+        return $this->transactionForMerchantOrder(function () use ($merchantId, $merchantOrderNo, $payAmount, $bizFields, $input, $merchant) {
+            $bizOrder = $this->bizOrderRepository->findForUpdateByMerchantAndOrderNo($merchantId, $merchantOrderNo);
+            if ($bizOrder) {
+                $reused = $this->payOrderReuseService->resolveLocked($bizOrder, $input, $merchant);
+                if ($reused !== null) {
+                    $reused['cashier_url'] = $reused['payment_page_url'];
+                    return $reused;
+                }
+                $this->assertBizOrderReusable($bizOrder, $merchantId, $merchantOrderNo, $payAmount);
+            } else {
+                $bizOrder = $this->createBizOrder($merchantId, $merchantOrderNo, $payAmount, $bizFields, $this->resolvePayOrderExpireAt());
+            }
+            return [
+                'merchant' => $merchant,
+                'biz_order' => $bizOrder,
+                'cashier_url' => $this->buildCashierPageUrl((string) $bizOrder->biz_no),
+            ];
         });
-
-        return [
-            'merchant' => $merchant,
-            'biz_order' => $bizOrder,
-            'cashier_url' => $this->buildCashierPageUrl((string) $bizOrder->biz_no),
-        ];
     }
 
     /**
@@ -312,8 +342,12 @@ class PayOrderAttemptService extends BaseService
                 $merchantOrderNo,
                 $payAmount,
                 $bizFields,
-                $expireAt
+                $expireAt,
+                $merchant,
+                $input,
+                !empty($route['selected_channel']['direct']) ? (int) $channel->id : null
             );
+            if (isset($bizContext['reused_result'])) return $bizContext['reused_result'];
 
             /** @var BizOrder $bizOrder */
             $bizOrder = $bizContext['biz_order'];
@@ -336,6 +370,8 @@ class PayOrderAttemptService extends BaseService
             $this->markBizOrderPaying($bizOrder, $payOrder, (int) $bizContext['attempt_no']);
 
             return [
+                'created' => true,
+                'reused' => false,
                 'merchant' => $merchant,
                 'biz_order' => $bizOrder->refresh(),
                 'pay_order' => $payOrder,
@@ -345,7 +381,7 @@ class PayOrderAttemptService extends BaseService
 
         // Acquire the durable guard BEFORE any business-order/account locks. Only local database
         // work is retried for deadlocks; no identity authorization, plugin or network call is inside.
-        return $this->transactionRetry(fn () => $channel->plugin_code === AlipayStoreReceiptRules::PLUGIN
+        return $this->transactionForMerchantOrder(fn () => $channel->plugin_code === AlipayStoreReceiptRules::PLUGIN
             ? AlipayReceiptGuard::atomic($create)
             : $create());
     }
@@ -353,6 +389,8 @@ class PayOrderAttemptService extends BaseService
     /** Outside the reservation transaction: unknown/late payment failures must never switch stores. */
     private function dispatchPayAttempt(array $prepared, PaymentChannel $channel, Merchant $merchant): array
     {
+        // 仅创建者有权派发；复用和并发等待绝不能再次调用插件。
+        if (($prepared['created'] ?? false) !== true) return $prepared;
         /** @var PayOrder $payOrder */
         $payOrder = $prepared['pay_order'];
         /** @var BizOrder $bizOrder */
@@ -436,13 +474,16 @@ class PayOrderAttemptService extends BaseService
         string $merchantOrderNo,
         int $payAmount,
         array $bizFields,
-        ?string $expireAt
+        ?string $expireAt,
+        Merchant $merchant,
+        array $input,
+        ?int $channelId
     ): array {
         $bizOrder = $this->bizOrderRepository->findForUpdateByMerchantAndOrderNo($merchantId, $merchantOrderNo);
         if ($bizOrder) {
+            $reused = $this->payOrderReuseService->resolveLocked($bizOrder, $input, $merchant, $channelId);
+            if ($reused !== null) return ['reused_result' => $reused];
             $this->assertBizOrderReusable($bizOrder, $merchantId, $merchantOrderNo, $payAmount);
-            $this->assertNoActivePayAttempt($bizOrder);
-            $this->assertBizOrderConsistency($bizOrder, $bizFields);
             $attemptNo = (int) $bizOrder->attempt_count + 1;
             $this->assertPayAttemptAllowed($bizOrder, $attemptNo);
 
@@ -460,38 +501,6 @@ class PayOrderAttemptService extends BaseService
             'attempt_no' => 1,
             'trace_no' => (string) $bizOrder->trace_no,
         ];
-    }
-
-    /**
-     * 在事务内创建或复用收银台业务单。
-     *
-     * @param int $merchantId 商户ID
-     * @param string $merchantOrderNo 商户订单号
-     * @param int $payAmount 支付金额
-     * @param array<string, mixed> $bizFields 业务单字段
-     * @return BizOrder 业务单
-     */
-    private function prepareCashierBizOrderInCurrentTransaction(
-        int $merchantId,
-        string $merchantOrderNo,
-        int $payAmount,
-        array $bizFields
-    ): BizOrder {
-        $bizOrder = $this->bizOrderRepository->findForUpdateByMerchantAndOrderNo($merchantId, $merchantOrderNo);
-        if ($bizOrder) {
-            $this->assertBizOrderReusable($bizOrder, $merchantId, $merchantOrderNo, $payAmount);
-            $this->assertBizOrderConsistency($bizOrder, $bizFields);
-
-            return $bizOrder->refresh();
-        }
-
-        return $this->createBizOrder(
-            $merchantId,
-            $merchantOrderNo,
-            $payAmount,
-            $bizFields,
-            $this->resolvePayOrderExpireAt()
-        )->refresh();
     }
 
     /**
@@ -802,58 +811,16 @@ class PayOrderAttemptService extends BaseService
         return ((int) $integer) * 100 + (int) substr($fraction, 0, 2);
     }
 
-    /**
-     * 防止同一业务单并发创建多个支付中订单。
-     *
-     * @param BizOrder $bizOrder 业务单
-     * @return void
-     * @throws ConflictException
-     */
-    private function assertNoActivePayAttempt(BizOrder $bizOrder): void
+    /** 只重试已回滚的本地建单事务；不重试身份授权或插件网络调用。 */
+    private function transactionForMerchantOrder(callable $callback): mixed
     {
-        if (empty($bizOrder->active_pay_no)) {
-            return;
-        }
-
-        $activePayOrder = $this->payOrderRepository->findForUpdateByPayNo((string) $bizOrder->active_pay_no);
-        if ($activePayOrder && in_array((int) $activePayOrder->status, [
-            TradeConstant::ORDER_STATUS_CREATED,
-            TradeConstant::ORDER_STATUS_PAYING,
-        ], true)) {
-            throw new ConflictException('重复请求', [
-                'biz_no' => (string) $bizOrder->biz_no,
-                'active_pay_no' => (string) $bizOrder->active_pay_no,
-            ]);
-        }
-    }
-
-    /**
-     * 校验业务单关键字段是否与首次写入保持一致。
-     *
-     * @param BizOrder $bizOrder 业务单
-     * @param array<string, mixed> $fields 当前请求整理后的字段
-     * @return void
-     * @throws ConflictException
-     */
-    private function assertBizOrderConsistency(BizOrder $bizOrder, array $fields): void
-    {
-        foreach (['subject', 'body', 'notify_url', 'return_url', 'client_ip', 'device'] as $field) {
-            $current = trim((string) ($bizOrder->{$field} ?? ''));
-            $incoming = trim((string) ($fields[$field] ?? ''));
-            if ($current !== $incoming) {
-                throw new ConflictException('商户订单信息不一致', [
-                    'biz_no' => (string) $bizOrder->biz_no,
-                    'field' => $field,
-                ]);
+        for ($race = 0; ; ++$race) {
+            try {
+                return $this->transactionRetry($callback);
+            } catch (QueryException $e) {
+                if ($race >= 1 || !PayOrderReuseService::isMerchantOrderRace($e)) throw $e;
+                // 首次同号插入竞争：新事务重新读取并校验获胜者，不能跳过一致性校验。
             }
-        }
-
-        $currentExtJson = (array) ($bizOrder->ext_json ?? []);
-        $incomingExtJson = (array) ($fields['ext_json'] ?? []);
-        if ($currentExtJson != $incomingExtJson) {
-            throw new ConflictException('商户订单扩展信息不一致', [
-                'biz_no' => (string) $bizOrder->biz_no,
-            ]);
         }
     }
 
