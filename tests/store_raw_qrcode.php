@@ -65,7 +65,8 @@ $location = rawQrLocation($v1->submit($payload, $payload, $request));
 check(str_ends_with($location, '/payment/' . $pay->pay_no), 'API 原单切回页面入口仍跳 mpay，不直跳支付宝');
 check(routingCounts() === $counts && $pay->fresh()->getAttributes() === $attrs,
     '重复访问不增加资金记录、不延长有效期、不重新分配金额');
-$conf = $f['config']; $savedConfig = $conf->config;
+// Compare DB-normalized JSON snapshots, not the insertion order of an unsaved PHP array.
+$conf = $f['config']->fresh(); $savedConfig = $conf->config;
 $conf->config = array_replace($savedConfig, ['receipt_qrcode_content' => 'changed-test-only']);
 routingRejects(fn () => $conf->save(), \app\exception\PaymentException::class, '原码订单待支付期间仍禁止修改收款二维码');
 check($conf->fresh()->config === $savedConfig, '被拒绝的二维码修改没有落库');
