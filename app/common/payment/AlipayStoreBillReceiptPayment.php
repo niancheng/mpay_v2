@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace app\common\payment;
 
+use app\common\constant\EpayProtocolConstant;
 use app\common\constant\PaymentPluginStatusConstant;
 use app\common\constant\TradeConstant;
 use app\common\util\FormatHelper;
@@ -26,11 +27,21 @@ class AlipayStoreBillReceiptPayment extends AlipayBillReceiptPayment
         parent::__construct($orders, $channels, $types);
         $this->paymentInfo['code'] = Rules::PLUGIN;
         $this->paymentInfo['name'] = '支付宝门店账单收款';
-        $this->paymentInfo['version'] = '1.0.0';
+        $this->paymentInfo['version'] = '1.1.0';
         $schema = [];
         foreach ($this->paymentInfo['config_schema'] as $field) {
             if ($field['field'] === 'receipt_match_mode') continue;
             $schema[] = $field;
+            if ($field['field'] === 'amount_offset_max') {
+                $schema[] = [
+                    'type' => 'radio', 'field' => 'receipt_qrcode_output', 'title' => '二维码接口输出', 'value' => 'cashier',
+                    'options' => [
+                        ['label' => 'mpay 收银台（默认）', 'value' => 'cashier'],
+                        ['label' => '支付宝原始二维码', 'value' => 'raw'],
+                    ],
+                    'info' => '仅易支付 API 下单生效。需最大金额偏移为 0、实付等于原金额且已填写收款码内容，否则回退收银台。页面跳转模式不变。',
+                ];
+            }
             if ($field['field'] === 'bill_user_id') {
                 $schema[] = ['type' => 'input', 'field' => 'store_no', 'title' => '门店编号', 'value' => '',
                     'props' => ['placeholder' => '完整编号，例如：店铺1793551172076'],
@@ -60,13 +71,43 @@ class AlipayStoreBillReceiptPayment extends AlipayBillReceiptPayment
         $payNo = (string) ($order['pay_no'] ?? '');
         $meta = (new AlipayStoreReceiptAllocationService($this->payOrderRepository))
             ->prepareForPresentation($payNo, $this->channelConfig);
+        return $this->buildReceiptPaymentResult($order, $meta);
+    }
+
+    /** Only presentation changes here; allocation, expiry and QR content come from the saved snapshot. */
+    private function buildReceiptPaymentResult(array $order, array $meta): array
+    {
+        $payNo = (string) ($order['pay_no'] ?? '');
         $params = ['_page' => 'receiptQrcode', 'amount' => FormatHelper::amount((int) $meta['receipt_amount']),
             'original_amount' => FormatHelper::amount((int) $meta['original_amount']), 'receipt_match_mode' => 'amount',
             'receipt_valid_seconds' => $this->receiptValidSeconds(), 'expire_at' => $meta['expire_at'],
             'expire_at_timestamp' => Rules::timestamp($meta['expire_at']), 'server_time_timestamp' => time(),
             'description' => '请使用支付宝扫描二维码，并严格按照页面显示的金额付款。'];
         foreach (['qrcode', 'qrcode_image'] as $key) if ($meta[$key] !== '') $params[$key] = $meta[$key];
-        return $this->pendingPaymentResult($order, $this->payResult($params, $payNo, 'alipay'));
+        $result = $this->payResult($params, $payNo, 'alipay');
+        if ($this->shouldOutputRawQrcode($order, $meta)) {
+            $result['pay_page'] = 'qrcode';
+        }
+        // Keep receiptQrcode and the original amount/expiry parameters for the existing MPAY page.
+        // V1/V2 API adapters expose only the snapshot's qrcode via their standard QR response fields.
+        return $this->pendingPaymentResult($order, $result);
+    }
+
+    private function shouldOutputRawQrcode(array $order, array $meta): bool
+    {
+        $extra = (array) ($order['extra'] ?? []);
+        $payment = (array) ($extra['payment'] ?? []);
+        return $this->getConfig('receipt_qrcode_output', 'cashier') === 'raw'
+            && ($extra['_submit_type'] ?? '') === EpayProtocolConstant::SUBMIT_TYPE_API
+            && in_array($extra['_protocol_version'] ?? '', [EpayProtocolConstant::VERSION_V1, EpayProtocolConstant::VERSION_V2], true)
+            && ($payment['method'] ?? 'web') === 'web'
+            && strtolower(trim((string) ($order['_env'] ?? ''))) !== 'jump'
+            && (int) $this->getConfig('amount_offset_max', 99) === 0
+            && ($meta['mode'] ?? '') === 'amount'
+            && (int) ($meta['original_amount'] ?? 0) > 0
+            && (int) ($meta['receipt_amount'] ?? 0) === (int) $meta['original_amount']
+            && is_string($meta['qrcode'] ?? null)
+            && trim($meta['qrcode']) !== '';
     }
 
     private function assertLiveConfig(): void
