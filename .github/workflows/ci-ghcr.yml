@@ -57,10 +57,14 @@ jobs:
       - name: Persistent data layout regression
         run: php tests/docker_data_layout.php
       - run: php tests/store_rules.php
+      - name: Store raw QR presentation unit regression
+        run: php tests/store_raw_qrcode_unit.php
       - run: php tests/store_integration.php
       - run: php tests/store_concurrency.php
       - run: php tests/store_routing.php
       - run: php tests/store_routing_concurrency.php
+      - name: Store raw QR signed V1/V2 and database regression
+        run: php tests/store_raw_qrcode.php
       - name: Payment reuse state and signed V2 protocol regression
         run: php tests/payment_reuse.php
       - name: Signed V1 submit and API reuse regression
