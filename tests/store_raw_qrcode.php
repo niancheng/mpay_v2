@@ -66,8 +66,12 @@ check(str_ends_with($location, '/payment/' . $pay->pay_no), 'API 原单切回页
 check(routingCounts() === $counts && $pay->fresh()->getAttributes() === $attrs,
     '重复访问不增加资金记录、不延长有效期、不重新分配金额');
 $conf = $f['config']; $savedConfig = $conf->config;
-$conf->config = array_replace($savedConfig, ['receipt_qrcode_output' => 'cashier', 'receipt_qrcode_content' => 'changed-test-only']); $conf->save();
-check($v1->mapi($payload, $payload, $request) === $first, '配置改变后原单仍复用已经保存的二维码，不偷偷换码');
+$conf->config = array_replace($savedConfig, ['receipt_qrcode_content' => 'changed-test-only']);
+routingRejects(fn () => $conf->save(), \app\exception\PaymentException::class, '原码订单待支付期间仍禁止修改收款二维码');
+check($conf->fresh()->config === $savedConfig, '被拒绝的二维码修改没有落库');
+$conf = $conf->fresh();
+$conf->config = array_replace($savedConfig, ['receipt_qrcode_output' => 'cashier']); $conf->save();
+check($v1->mapi($payload, $payload, $request) === $first, '展示开关改变后原单仍复用已经保存的二维码，不偷偷换码');
 $conf->config = $savedConfig; $conf->save();
 $bad = $payload; $bad['sign'] = 'invalid';
 check($v1->mapi($bad, $bad, $request)['code'] === 0, '原码订单的重复请求仍要求有效签名');
